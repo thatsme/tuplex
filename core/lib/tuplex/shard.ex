@@ -110,13 +110,63 @@ defmodule Tuplex.Shard do
   # crash dumps. A constant keeps shard creation from minting a fresh atom per tag.
   @table_label :tuplex_shard
 
-  defstruct [:tag, :tab, :seq, waiters: %{}, index: %{}, monitors: %{}, leases: %{}]
+  defstruct [
+    :tag,
+    :tab,
+    :seq,
+    waiters: %{},
+    waiter_index: %{},
+    watches: %{},
+    watch_index: %{},
+    leases: %{},
+    # mref => {:waiter | :watch | :lease, ref}. One map for every monitor the shard holds,
+    # tagged by what it is watching, so a :DOWN needs one lookup rather than three misses.
+    monitors: %{}
+  ]
 
   @typedoc "The tag a shard is responsible for."
   @type tag :: atom()
 
   @typedoc "Whether a waiter consumes the tuple it is given."
   @type mode :: :in | :rd
+
+  @typedoc """
+  How a taken tuple is held.
+
+  `false` removes it outright. `:monitor` holds it for the caller's lifetime, discarding on
+  a normal exit and requeueing on any other. `{:monitor, :ack}` holds it until
+  `Tuplex.ack/1`, requeueing on *any* exit that arrives first — including a normal one,
+  since without an acknowledgement there is nothing to say the work was finished.
+  """
+  @type lease :: false | :monitor | {:monitor, :ack}
+
+  @typedoc "What a watcher is told about."
+  @type event :: :out | :in | :requeue
+
+  @typedoc "An opaque handle to a held tuple, for `ack/1`."
+  @opaque handle :: {tag(), reference()}
+
+  @doc """
+  Releases a held tuple: the work it represents is finished.
+
+  Only meaningful for a `{:monitor, :ack}` lease, where nothing else discards the tuple.
+  Returns `:ok` whether or not the lease is still held, so a duplicate acknowledgement is
+  harmless and one racing an expiry does not raise.
+  """
+  @spec ack(handle()) :: :ok
+  def ack({tag, ref}) do
+    call_existing(tag, {:ack, ref}, :ok)
+  end
+
+  @doc false
+  def register_watch(tag, ref, template, events, subscriber, max_queue) do
+    call_shard(tag, {:watch, ref, template, events, subscriber, max_queue})
+  end
+
+  @doc false
+  def unregister_watch(tag, ref) do
+    call_existing(tag, {:unwatch, ref}, :ok)
+  end
 
   @doc false
   def start_link(tag) when is_atom(tag) do
@@ -150,10 +200,7 @@ defmodule Tuplex.Shard do
   @spec out(Template.t()) :: {:ok, Store.seq()}
   def out(tuple) do
     {tag, _arity} = Template.key(tuple)
-
-    with {:ok, pid} <- ensure(tag) do
-      GenServer.call(pid, {:out, tuple})
-    end
+    call_shard(tag, {:out, tuple})
   end
 
   @doc """
@@ -162,14 +209,11 @@ defmodule Tuplex.Shard do
   Returns `:empty` when nothing matches, and does not start a shard: a tag with no shard
   has nothing to take.
   """
-  @spec take(Template.template(), boolean()) :: {:ok, Template.t()} | :empty
-  def take(template, lease? \\ false) do
+  @spec take(Template.template(), lease()) ::
+          {:ok, Template.t()} | {:ok, Template.t(), handle()} | :empty
+  def take(template, lease \\ false) do
     {tag, _arity} = Template.key(template)
-
-    case lookup(tag) do
-      {:ok, pid, _tab} -> GenServer.call(pid, {:take, template, lease?})
-      :error -> :empty
-    end
+    call_existing(tag, {:take, template, lease}, :empty)
   end
 
   @doc """
@@ -284,24 +328,30 @@ defmodule Tuplex.Shard do
     end
   end
 
-  defp register_and_block(pid, mref, mode, template, ref, deadline, lease?) do
-    case safe_call(pid, {:wait, mode, template, ref, lease?}) do
+  defp register_and_block(pid, mref, mode, template, ref, deadline, lease) do
+    case safe_call(pid, {:wait, mode, template, ref, lease}) do
       {:ok, tuple} -> {:ok, tuple}
-      :waiting -> block(pid, ref, mref, deadline)
+      {:ok, tuple, handle} -> {:ok, tuple, handle}
+      :waiting -> block(pid, ref, mref, deadline, lease)
       :down -> :shard_died
     end
   end
 
-  defp block(pid, ref, mref, deadline) do
+  defp block(pid, ref, mref, deadline, lease) do
     receive do
-      {__MODULE__, ^ref, tuple} -> {:ok, tuple}
+      {__MODULE__, ^ref, payload} -> served(payload, lease)
       {:DOWN, ^mref, :process, _pid, _reason} -> :shard_died
     after
-      remaining(deadline) -> cancel(pid, ref)
+      remaining(deadline) -> cancel(pid, ref, lease)
     end
   end
 
-  defp cancel(pid, ref) do
+  # A caller that asked to acknowledge is handed the lease alongside the tuple; everybody
+  # else sees the shape they have always seen.
+  defp served({tuple, handle}, {:monitor, :ack}), do: {:ok, tuple, handle}
+  defp served(tuple, _lease), do: {:ok, tuple}
+
+  defp cancel(pid, ref, lease) do
     _ = safe_call(pid, {:cancel, ref})
 
     # The shard may have served us in the instant before the cancel arrived, in which case
@@ -309,7 +359,7 @@ defmodule Tuplex.Shard do
     # messages come from the shard, so ordering guarantees the tuple is already in the
     # mailbox by the time the cancel has been answered.
     receive do
-      {__MODULE__, ^ref, tuple} -> {:ok, tuple}
+      {__MODULE__, ^ref, payload} -> served(payload, lease)
     after
       0 -> {:error, :timeout}
     end
@@ -360,8 +410,8 @@ defmodule Tuplex.Shard do
   # is gone with the shard and the tuple is requeued as though the work had failed. Losing
   # it instead would be worse.
   defp reclaim_leases(state, recovered) do
-    Enum.reduce(recovered, state, fn {seq, _tuple, ref, pid}, acc ->
-      hold(acc, pid, seq, ref)
+    Enum.reduce(recovered, state, fn {seq, _tuple, ref, pid, mode}, acc ->
+      hold(acc, pid, seq, ref, mode)
     end)
   end
 
@@ -371,53 +421,56 @@ defmodule Tuplex.Shard do
     # before inserting would leave a window in which a concurrent caller-side read sees a
     # gap where the tuple never existed, and would put a hole in the sequence accounting.
     :ok = Store.insert(state.tab, seq, tuple)
-    state = serve(%{state | seq: seq + 1}, tuple, seq)
+    state = serve(%{state | seq: seq + 1}, tuple, seq, :out)
 
     {:reply, {:ok, seq}, state}
   end
 
-  def handle_call({:take, template, lease?}, {pid, _tag}, state) do
-    case satisfy(state, :in, template, lease?, pid) do
-      {:ok, tuple, state} -> {:reply, {:ok, tuple}, state}
+  def handle_call({:take, template, lease}, {pid, _tag}, state) do
+    case satisfy(state, :in, template, lease, pid) do
+      {:ok, tuple, handle, state} -> {:reply, reply(lease, tuple, handle), state}
       :empty -> {:reply, :empty, state}
     end
   end
 
-  def handle_call({:wait, mode, template, ref, lease?}, {pid, _tag}, state) do
+  def handle_call({:wait, mode, template, ref, lease}, {pid, _tag}, state) do
     # A waiter is only filed if the space cannot satisfy it right now. Registration and
     # `out` are both serialised here, so there is no window between the two in which a
     # matching tuple could sit unnoticed while the caller blocks.
-    case satisfy(state, mode, template, lease?, pid) do
-      {:ok, tuple, state} -> {:reply, {:ok, tuple}, state}
-      :empty -> {:reply, :waiting, register(state, mode, template, ref, pid, lease?)}
+    case satisfy(state, mode, template, lease, pid) do
+      {:ok, tuple, handle, state} -> {:reply, reply(lease, tuple, handle), state}
+      :empty -> {:reply, :waiting, register(state, mode, template, ref, pid, lease)}
     end
   end
 
   def handle_call({:cancel, ref}, _from, state) do
-    {:reply, :ok, forget(state, ref)}
+    {:reply, :ok, forget_waiter(state, ref)}
   end
 
   def handle_call(:table, _from, state) do
     {:reply, state.tab, state}
   end
 
+  def handle_call({:watch, ref, template, events, subscriber, max_queue}, {pid, _tag}, state) do
+    {:reply, :ok, add_watch(state, ref, template, events, subscriber, max_queue, pid)}
+  end
+
+  def handle_call({:unwatch, ref}, _from, state) do
+    {:reply, :ok, forget_watch(state, ref)}
+  end
+
+  def handle_call({:ack, ref}, _from, state) do
+    {:reply, :ok, acknowledge(state, ref)}
+  end
+
   @impl true
   def handle_info({:DOWN, mref, :process, _pid, reason}, state) do
-    # One monitor ref means one of two things, and they live in different maps: a blocked
-    # caller that has gone away, or a lease holder that has finished or failed.
-    state =
-      case Map.fetch(state.monitors, mref) do
-        {:ok, ref} -> forget(state, ref)
-        :error -> state
-      end
-
-    state =
-      case Map.pop(state.leases, mref) do
-        {nil, _leases} -> state
-        {{seq, ref}, leases} -> settle(%{state | leases: leases}, seq, ref, reason)
-      end
-
-    {:noreply, state}
+    case Map.get(state.monitors, mref) do
+      {:waiter, ref} -> {:noreply, forget_waiter(state, ref)}
+      {:watch, ref} -> {:noreply, forget_watch(state, ref)}
+      {:lease, ref} -> {:noreply, expire(state, ref, reason)}
+      nil -> {:noreply, state}
+    end
   end
 
   # The ETS-TRANSFER that follows a claim from the keeper is only a notification; ownership
@@ -428,54 +481,115 @@ defmodule Tuplex.Shard do
 
   # -- leases -----------------------------------------------------------------
 
-  # Only a normal exit means the work was done. Everything else requeues, :shutdown and
-  # {:shutdown, _} included: a supervisor stopping a worker mid-lease is orderly, but the
-  # work still did not happen. A holder that finished should exit normally, or the lease
-  # was the wrong tool for it.
-  defp settle(state, seq, ref, :normal) do
+  # An acknowledgement is the holder saying the work is done, and in {:monitor, :ack} mode
+  # it is the only thing that says so.
+  defp acknowledge(state, ref) do
+    case Map.get(state.leases, ref) do
+      nil -> state
+      {seq, _mref, _mode} -> state |> release(seq, ref) |> drop_lease(ref)
+    end
+  end
+
+  # A holder that dies. In :monitor mode a normal exit means the work was done; every other
+  # reason requeues, :shutdown and {:shutdown, _} included, because a supervisor stopping a
+  # worker mid-lease is orderly but the work still did not happen.
+  #
+  # In {:monitor, :ack} mode *no* exit reason discards. The acknowledgement is the signal,
+  # and a process that exited without sending one did not finish, however tidily it went.
+  defp expire(state, ref, reason) do
+    case Map.get(state.leases, ref) do
+      nil ->
+        state
+
+      {seq, _mref, mode} ->
+        state = drop_lease(state, ref)
+
+        if discards?(mode, reason) do
+          release(state, seq, ref)
+        else
+          requeue(state, seq, ref)
+        end
+    end
+  end
+
+  defp discards?(:monitor, :normal), do: true
+  defp discards?(_mode, _reason), do: false
+
+  defp release(state, seq, ref) do
     :ok = Store.release(state.tab, seq, ref)
     state
   end
 
-  defp settle(state, seq, ref, _reason) do
+  defp requeue(state, seq, ref) do
     new_seq = state.seq
 
     case Store.requeue(state.tab, seq, ref, new_seq) do
       {:ok, tuple} ->
         # A requeued tuple is a fresh arrival as far as waiters are concerned — somebody may
         # already be blocked on it.
-        serve(%{state | seq: new_seq + 1}, tuple, new_seq)
+        serve(%{state | seq: new_seq + 1}, tuple, new_seq, :requeue)
 
       :error ->
         state
     end
   end
 
-  defp hold(state, pid, seq, ref) do
+  defp hold(state, pid, seq, ref, mode) do
     mref = Process.monitor(pid)
-    %{state | leases: Map.put(state.leases, mref, {seq, ref})}
+
+    %{
+      state
+      | leases: Map.put(state.leases, ref, {seq, mref, mode}),
+        monitors: Map.put(state.monitors, mref, {:lease, ref})
+    }
+  end
+
+  defp drop_lease(state, ref) do
+    case Map.pop(state.leases, ref) do
+      {nil, _leases} ->
+        state
+
+      {{_seq, mref, _mode}, leases} ->
+        Process.demonitor(mref, [:flush])
+        %{state | leases: leases, monitors: Map.delete(state.monitors, mref)}
+    end
   end
 
   # -- serving ----------------------------------------------------------------
 
-  defp satisfy(state, :rd, template, _lease?, _pid) do
-    with {:ok, tuple} <- Store.read(state.tab, template), do: {:ok, tuple, state}
-  end
-
-  defp satisfy(state, :in, template, false, _pid) do
-    with {:ok, tuple} <- Store.take(state.tab, template), do: {:ok, tuple, state}
-  end
-
-  defp satisfy(state, :in, template, true, pid) do
-    ref = make_ref()
-
-    case Store.lease(state.tab, template, ref, pid) do
-      {:ok, tuple, seq} -> {:ok, tuple, hold(state, pid, seq, ref)}
+  defp satisfy(state, :rd, template, _lease, _pid) do
+    case Store.read(state.tab, template) do
+      {:ok, tuple} -> {:ok, tuple, nil, state}
       :empty -> :empty
     end
   end
 
-  defp serve(state, tuple, seq) do
+  defp satisfy(state, :in, template, false, _pid) do
+    case Store.take(state.tab, template) do
+      {:ok, tuple} -> {:ok, tuple, nil, announce(state, :in, tuple)}
+      :empty -> :empty
+    end
+  end
+
+  defp satisfy(state, :in, template, mode, pid) do
+    ref = make_ref()
+
+    case Store.lease(state.tab, template, ref, pid, mode) do
+      {:ok, tuple, seq} ->
+        state = state |> hold(pid, seq, ref, mode) |> announce(:in, tuple)
+        {:ok, tuple, {state.tag, ref}, state}
+
+      :empty ->
+        :empty
+    end
+  end
+
+  defp serve(state, tuple, seq, event) do
+    # Watchers are observational, like readers, so they hear about the tuple before anything
+    # can consume it — and because insert comes before serve, what they are told about is
+    # something that genuinely existed in the space.
+    state = announce(state, event, tuple)
+
     case Map.get(state.waiters, Template.key(tuple)) do
       nil ->
         state
@@ -490,14 +604,18 @@ defmodule Tuplex.Shard do
           |> Enum.split_with(&(&1.mode == :rd))
 
         # Every matching reader is woken first...
-        state = Enum.reduce(readers, state, &deliver(&2, &1, tuple))
+        state = Enum.reduce(readers, state, &deliver(&2, &1, tuple, nil))
 
         # ...and only then does one taker consume the tuple. The other order would delete it
         # out from under readers that legitimately matched, leaving them blocked forever on
         # a tuple that has already come and gone.
         case takers do
           [taker | _rest] ->
-            state |> consume(taker, seq, tuple) |> deliver(taker, tuple)
+            {state, handle} = consume(state, taker, seq, tuple)
+
+            state
+            |> announce(:in, tuple)
+            |> deliver(taker, tuple, handle)
 
           [] ->
             state
@@ -507,41 +625,130 @@ defmodule Tuplex.Shard do
 
   defp consume(state, %{lease: false}, seq, _tuple) do
     :ok = Store.delete(state.tab, seq)
-    state
+    {state, nil}
   end
 
-  defp consume(state, %{lease: true, pid: pid}, seq, tuple) do
+  defp consume(state, %{lease: mode, pid: pid}, seq, tuple) do
     # The row is already in the table, so marking it leased is one insert under the key it
     # already has — the same atomic transition the immediate path gets.
     ref = make_ref()
-    :ok = Store.lease_row(state.tab, seq, tuple, ref, pid)
-    hold(state, pid, seq, ref)
+    :ok = Store.lease_row(state.tab, seq, tuple, ref, pid, mode)
+    {hold(state, pid, seq, ref, mode), {state.tag, ref}}
   end
 
-  defp deliver(state, waiter, tuple) do
-    send(waiter.pid, {__MODULE__, waiter.ref, tuple})
-    forget(state, waiter.ref)
+  defp deliver(state, waiter, tuple, handle) do
+    send(waiter.pid, {__MODULE__, waiter.ref, payload(waiter.lease, tuple, handle)})
+    forget_waiter(state, waiter.ref)
+  end
+
+  # Only a caller that asked to acknowledge gets the lease handle back, so the shape of a
+  # plain read is unchanged for everybody else.
+  defp payload({:monitor, :ack}, tuple, handle), do: {tuple, handle}
+  defp payload(_lease, tuple, _handle), do: tuple
+
+  defp reply({:monitor, :ack}, tuple, handle), do: {:ok, tuple, handle}
+  defp reply(_lease, tuple, _handle), do: {:ok, tuple}
+
+  # -- watchers ---------------------------------------------------------------
+
+  # Watchers are filed by key, exactly like waiters, so a tuple only has to be offered to
+  # the bucket it belongs to. Order within the bucket does not matter — every matching
+  # watcher is told and none of them consume — so the list stays newest-first.
+  defp announce(state, event, tuple) do
+    case Map.get(state.watches, Template.key(tuple)) do
+      nil ->
+        state
+
+      bucket ->
+        bucket
+        |> Enum.filter(&(event in &1.events and Template.matches?(&1.template, tuple)))
+        |> Enum.reduce(state, &notify(&2, &1, event, tuple))
+    end
+  end
+
+  # A watcher is pushed at, never asked, so nothing about its own pace reaches the shard. An
+  # unbounded send to a subscriber slower than the space is an unbounded mailbox that the
+  # shard can neither see nor recover from, so the queue is measured first and events past
+  # the threshold are dropped. Lossy on purpose, and reported: a debug console that quietly
+  # takes the node down with it is worse than one that misses events and says so.
+  defp notify(state, watcher, event, tuple) do
+    case Process.info(watcher.subscriber, :message_queue_len) do
+      {:message_queue_len, len} when len <= watcher.max_queue ->
+        send(watcher.subscriber, {__MODULE__, :watch, watcher.ref, event, tuple})
+        state
+
+      {:message_queue_len, len} ->
+        :telemetry.execute(
+          [:tuplex, :watch, :dropped],
+          %{count: 1, message_queue_len: len},
+          %{tag: state.tag, ref: watcher.ref, event: event, template: watcher.template}
+        )
+
+        state
+
+      nil ->
+        # The subscriber is gone. Its Tuplex.Watch will unregister shortly; there is nothing
+        # to gain from sending into the void until it does.
+        state
+    end
+  end
+
+  defp add_watch(state, ref, template, events, subscriber, max_queue, registrant) do
+    key = Template.key(template)
+    mref = Process.monitor(registrant)
+
+    watcher = %{
+      ref: ref,
+      template: template,
+      events: events,
+      subscriber: subscriber,
+      max_queue: max_queue
+    }
+
+    %{
+      state
+      | watches: Map.update(state.watches, key, [watcher], &[watcher | &1]),
+        watch_index: Map.put(state.watch_index, ref, {key, mref}),
+        monitors: Map.put(state.monitors, mref, {:watch, ref})
+    }
+  end
+
+  defp forget_watch(state, ref) do
+    case Map.pop(state.watch_index, ref) do
+      {nil, _index} ->
+        state
+
+      {{key, mref}, index} ->
+        Process.demonitor(mref, [:flush])
+
+        %{
+          state
+          | watches: drop_from_bucket(state.watches, key, ref),
+            watch_index: index,
+            monitors: Map.delete(state.monitors, mref)
+        }
+    end
   end
 
   # -- the waiter index -------------------------------------------------------
 
-  defp register(state, mode, template, ref, pid, lease?) do
+  defp register(state, mode, template, ref, pid, lease) do
     key = Template.key(template)
     mref = Process.monitor(pid)
-    waiter = %{ref: ref, pid: pid, mode: mode, template: template, monitor: mref, lease: lease?}
+    waiter = %{ref: ref, pid: pid, mode: mode, template: template, lease: lease}
 
     %{
       state
-      | # Newest-first, because prepending is O(1); serve/3 reverses it so waiters are
+      | # Newest-first, because prepending is O(1); serve/4 reverses it so waiters are
         # offered in arrival order rather than in whatever order the cons cell produced.
         waiters: Map.update(state.waiters, key, [waiter], &[waiter | &1]),
-        index: Map.put(state.index, ref, {key, mref}),
-        monitors: Map.put(state.monitors, mref, ref)
+        waiter_index: Map.put(state.waiter_index, ref, {key, mref}),
+        monitors: Map.put(state.monitors, mref, {:waiter, ref})
     }
   end
 
-  defp forget(state, ref) do
-    case Map.pop(state.index, ref) do
+  defp forget_waiter(state, ref) do
+    case Map.pop(state.waiter_index, ref) do
       {nil, _index} ->
         state
 
@@ -551,22 +758,76 @@ defmodule Tuplex.Shard do
         %{
           state
           | waiters: drop_from_bucket(state.waiters, key, ref),
-            index: index,
+            waiter_index: index,
             monitors: Map.delete(state.monitors, mref)
         }
     end
   end
 
-  defp drop_from_bucket(waiters, key, ref) do
-    case Enum.reject(Map.get(waiters, key, []), &(&1.ref == ref)) do
-      [] -> Map.delete(waiters, key)
-      bucket -> Map.put(waiters, key, bucket)
+  defp drop_from_bucket(buckets, key, ref) do
+    case Enum.reject(Map.get(buckets, key, []), &(&1.ref == ref)) do
+      [] -> Map.delete(buckets, key)
+      bucket -> Map.put(buckets, key, bucket)
     end
   end
 
   # -- internals --------------------------------------------------------------
 
   defp via(tag), do: {:via, Registry, {@registry, tag}}
+
+  # How long a call will keep trying to find a live shard for its tag.
+  @resolve_timeout 5_000
+
+  # A shard can die between being resolved and being called, and the registry's cleanup is
+  # asynchronous, so for a moment the tag still names the corpse. Now that the table outlives
+  # the shard, the right answer is to wait for the replacement rather than to fail.
+  #
+  # Only a `:noproc` exit is retried. It is the one reason that proves the message was never
+  # delivered; any other exit could mean the call was handled and the shard died afterwards,
+  # and retrying that would write a tuple twice.
+  defp call_shard(tag, message) do
+    call_shard(tag, message, System.monotonic_time(:millisecond) + @resolve_timeout)
+  end
+
+  defp call_shard(tag, message, deadline) do
+    with {:ok, pid} <- ensure(tag) do
+      try do
+        GenServer.call(pid, message)
+      catch
+        :exit, {:noproc, _details} -> again(tag, message, deadline, &call_shard/3)
+      end
+    end
+  end
+
+  # As above, but for calls that must not start a shard: with no shard there is nothing to
+  # take, unwatch, or acknowledge, and `default` is the honest answer.
+  defp call_existing(tag, message, default) do
+    call_existing(tag, message, default, System.monotonic_time(:millisecond) + @resolve_timeout)
+  end
+
+  defp call_existing(tag, message, default, deadline) do
+    case lookup(tag) do
+      {:ok, pid, _tab} ->
+        try do
+          GenServer.call(pid, message)
+        catch
+          :exit, {:noproc, _details} ->
+            again(tag, message, deadline, &call_existing(&1, &2, default, &3))
+        end
+
+      :error ->
+        default
+    end
+  end
+
+  defp again(tag, message, deadline, retry) do
+    if System.monotonic_time(:millisecond) < deadline do
+      Process.sleep(2)
+      retry.(tag, message, deadline)
+    else
+      exit({:noproc, {__MODULE__, :call, [tag, message]}})
+    end
+  end
 
   # One retry, never a loop. Which of the three outcomes applies turns on what the registry
   # says the second time.

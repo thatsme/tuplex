@@ -16,7 +16,7 @@ defmodule Tuplex.LeaseTest do
 
       holder =
         spawn_holder(tag, fn ->
-          assert [{_seq, {^tag, 1}, _ref, holder_pid}] = Store.leased(table(tag))
+          assert [{_seq, {^tag, 1}, _ref, holder_pid, :monitor}] = Store.leased(table(tag))
           assert holder_pid == self()
         end)
 
@@ -116,7 +116,7 @@ defmodule Tuplex.LeaseTest do
 
       # Marked in place rather than removed: still one row, and it is held.
       assert Store.size(table(tag)) == 1
-      assert [{_seq, {^tag, 1}, _ref, _pid}] = Store.leased(table(tag))
+      assert [{_seq, {^tag, 1}, _ref, _pid, :monitor}] = Store.leased(table(tag))
 
       finish(holder, :boom)
       assert wait_until(fn -> Tuplex.rdp({tag, :_}) == {:ok, {tag, 1}} end)
@@ -131,7 +131,7 @@ defmodule Tuplex.LeaseTest do
 
       holder =
         spawn(fn ->
-          send(parent, {:took, self(), Tuplex.inp({tag, :_}, lease: true)})
+          send(parent, {:took, self(), Tuplex.inp({tag, :_}, lease: :monitor)})
           park()
         end)
 
@@ -146,12 +146,12 @@ defmodule Tuplex.LeaseTest do
   describe "option validation" do
     test "rd/2 refuses a lease", %{tag: tag} do
       assert_raise ArgumentError, ~r/:lease applies to in\/2 and inp\/2 only/, fn ->
-        Tuplex.rd({tag, :_}, lease: true)
+        Tuplex.rd({tag, :_}, lease: :monitor)
       end
     end
 
     test "rejects a non-boolean lease", %{tag: tag} do
-      assert_raise ArgumentError, ~r/:lease must be true or false/, fn ->
+      assert_raise ArgumentError, ~r/:lease must be false, :monitor/, fn ->
         Tuplex.in({tag, :_}, lease: :yes)
       end
     end
@@ -165,7 +165,7 @@ defmodule Tuplex.LeaseTest do
     parent = self()
 
     spawn(fn ->
-      result = Tuplex.in({tag, :_}, lease: true)
+      result = Tuplex.in({tag, :_}, lease: :monitor)
       after_take.()
       send(parent, {:took, self(), result})
       park()

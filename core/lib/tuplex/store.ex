@@ -10,16 +10,17 @@ defmodule Tuplex.Store do
 
   An `:ordered_set` keyed by a monotonically increasing sequence number:
 
-      {seq, tuple}                          # free
-      {seq, tuple, {:leased, ref, pid}}     # held by a consumer
-      {seq, tuple, {:requeueing, new_seq}}  # a requeue caught mid-flight
+      {seq, tuple}                             # free
+      {seq, tuple, {:leased, ref, pid, mode}}  # held by a consumer
+      {seq, tuple, {:requeueing, new_seq}}     # a requeue caught mid-flight
 
   The sequence number comes from the calling shard's counter, so `Store` stays
   deterministic and testable without a process behind it.
 
   A leased tuple is **not** removed from the table, only marked, which makes the
   free-to-leased transition a single atomic `:ets.insert/2` under the same key. See
-  `lease/4` for why that matters. The third element also means a leased row has arity 3,
+  `lease/5` for why that matters. The mode travels in the row too, so a shard reclaiming a
+  table after a crash knows how each held tuple is meant to be settled. The third element also means a leased row has arity 3,
   so the arity-2 head pattern every read uses cannot match it — leased tuples are invisible
   to `read/2`, `read_all/2` and `take/2` for free.
 
@@ -242,12 +243,12 @@ defmodule Tuplex.Store do
   to do. Marking in place removes the window rather than narrowing it, and leaves the table
   itself as the authoritative record of who holds what.
   """
-  @spec lease(tab(), Template.template(), reference(), pid()) ::
+  @spec lease(tab(), Template.template(), reference(), pid(), term()) ::
           {:ok, Template.t(), seq()} | :empty
-  def lease(tab, template, ref, pid) do
+  def lease(tab, template, ref, pid, mode) do
     case first(tab, template) do
       {seq, tuple} ->
-        :ok = lease_row(tab, seq, tuple, ref, pid)
+        :ok = lease_row(tab, seq, tuple, ref, pid, mode)
         {:ok, tuple, seq}
 
       nil ->
@@ -261,9 +262,9 @@ defmodule Tuplex.Store do
   For the case where the tuple has just been written and handed straight to a waiter: it is
   already in the table, so there is nothing to select.
   """
-  @spec lease_row(tab(), seq(), Template.t(), reference(), pid()) :: :ok
-  def lease_row(tab, seq, tuple, ref, pid) do
-    true = :ets.insert(tab, {seq, tuple, {:leased, ref, pid}})
+  @spec lease_row(tab(), seq(), Template.t(), reference(), pid(), term()) :: :ok
+  def lease_row(tab, seq, tuple, ref, pid, mode) do
+    true = :ets.insert(tab, {seq, tuple, {:leased, ref, pid, mode}})
     :ok
   end
 
@@ -276,7 +277,7 @@ defmodule Tuplex.Store do
   @spec release(tab(), seq(), reference()) :: :ok
   def release(tab, seq, ref) do
     case :ets.lookup(tab, seq) do
-      [{^seq, _tuple, {:leased, ^ref, _pid}}] ->
+      [{^seq, _tuple, {:leased, ^ref, _pid, _mode}}] ->
         true = :ets.delete(tab, seq)
         :ok
 
@@ -305,7 +306,7 @@ defmodule Tuplex.Store do
   @spec requeue(tab(), seq(), reference(), seq()) :: {:ok, Template.t()} | :error
   def requeue(tab, seq, ref, new_seq) do
     case :ets.lookup(tab, seq) do
-      [{^seq, tuple, {:leased, ^ref, _pid}}] ->
+      [{^seq, tuple, {:leased, ^ref, _pid, _mode}}] ->
         true = :ets.insert(tab, {seq, tuple, {:requeueing, new_seq}})
         true = :ets.insert(tab, {new_seq, tuple})
         true = :ets.delete(tab, seq)
@@ -328,7 +329,7 @@ defmodule Tuplex.Store do
 
   Call it before `next_seq/1`, since finishing a requeue can add a row.
   """
-  @spec recover(tab()) :: [{seq(), Template.t(), reference(), pid()}]
+  @spec recover(tab()) :: [{seq(), Template.t(), reference(), pid(), term()}]
   def recover(tab) do
     rows = held(tab)
 
@@ -337,16 +338,16 @@ defmodule Tuplex.Store do
       :ets.delete(tab, seq)
     end
 
-    for {seq, tuple, {:leased, ref, pid}} <- rows, do: {seq, tuple, ref, pid}
+    for {seq, tuple, {:leased, ref, pid, mode}} <- rows, do: {seq, tuple, ref, pid, mode}
   end
 
   @doc """
   Returns `{seq, tuple, ref, pid}` for every currently leased row. For tests and
   introspection.
   """
-  @spec leased(tab()) :: [{seq(), Template.t(), reference(), pid()}]
+  @spec leased(tab()) :: [{seq(), Template.t(), reference(), pid(), term()}]
   def leased(tab) do
-    for {seq, tuple, {:leased, ref, pid}} <- held(tab), do: {seq, tuple, ref, pid}
+    for {seq, tuple, {:leased, ref, pid, mode}} <- held(tab), do: {seq, tuple, ref, pid, mode}
   end
 
   @doc """

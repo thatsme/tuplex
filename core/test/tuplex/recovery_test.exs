@@ -18,9 +18,9 @@ defmodule Tuplex.RecoveryTest do
     test "reports leased rows", %{tab: tab} do
       ref = make_ref()
       Store.insert(tab, 1, {:job, :free})
-      :ok = Store.lease_row(tab, 2, {:job, :held}, ref, self())
+      :ok = Store.lease_row(tab, 2, {:job, :held}, ref, self(), :monitor)
 
-      assert [{2, {:job, :held}, ^ref, held_by}] = Store.recover(tab)
+      assert [{2, {:job, :held}, ^ref, held_by, :monitor}] = Store.recover(tab)
       assert held_by == self()
     end
 
@@ -100,7 +100,7 @@ defmodule Tuplex.RecoveryTest do
       restart(tag, shard)
 
       # Still held, still invisible, and the new shard is watching the holder again.
-      assert [{_seq, {^tag, 1}, _ref, ^holder}] = Store.leased(table(tag))
+      assert [{_seq, {^tag, 1}, _ref, ^holder, :monitor}] = Store.leased(table(tag))
       assert :empty = Tuplex.rdp({tag, :_})
 
       send(holder, {:finish, :boom})
@@ -151,7 +151,7 @@ defmodule Tuplex.RecoveryTest do
     parent = self()
 
     spawn(fn ->
-      send(parent, {:took, self(), Tuplex.in({tag, :_}, lease: true)})
+      send(parent, {:took, self(), Tuplex.in({tag, :_}, lease: :monitor)})
 
       receive do
         {:finish, reason} -> exit(reason)

@@ -41,13 +41,17 @@ defmodule Tuplex do
 
   > #### Work in progress {: .warning}
   >
-  > v0.1 is still being built. Available now: `out/1`, `in/2`, `rd/2`, `inp/2`, `rdp/1`,
-  > `take/2`, `tags/0`, and leases. Still to come: `rd_all/1`, `eval/1`, `watch/1`, and
-  > telemetry.
+  > v0.1 is still being built. Everything in the API is here — `out/1`, `in/2`, `rd/2`,
+  > `inp/2`, `rdp/1`, `rd_all/1`, `take/2`, `eval/1`, `watch/2`, `unwatch/1`, `ack/1`,
+  > `tags/0`, and leases. Still to come: telemetry across the whole surface, and the
+  > stateful property suite.
   """
 
   alias Tuplex.Shard
   alias Tuplex.Template
+  alias Tuplex.Watch
+
+  @default_max_queue 10_000
 
   @doc """
   Writes `tuple` into the space.
@@ -81,9 +85,9 @@ defmodule Tuplex do
       register a waiter at all; it behaves exactly like `inp/2`, reporting
       `{:error, :timeout}` where `inp/2` would say `:empty`.
 
-    * `:lease` — `false` by default. When `true`, the tuple is held against the calling
-      process rather than removed outright, and comes back if that process dies without
-      finishing. See below.
+    * `:lease` — `false` by default. `:monitor` or `{:monitor, :ack}` hold the tuple
+      against the calling process rather than removing it outright, so it comes back if
+      that process dies without finishing. See below.
 
   Exactly one blocked `in/2` receives any given tuple. Every `rd/2` waiting on a template
   that also matches is woken **first**, before this call consumes it, so a reader never
@@ -93,35 +97,53 @@ defmodule Tuplex do
 
   ## Leasing
 
-  Without a lease, a tuple taken by a process that then crashes is simply gone. With
-  `lease: true`, the tuple stays in the space marked as held by the caller, and:
+  Without a lease, a tuple taken by a process that then crashes is simply gone. A lease
+  keeps it in the space, marked as held, so that it comes back if the holder never finishes.
+  There are two ways to say what "finished" means.
 
-    * if the caller exits **normally**, the work is taken to have been done and the tuple
-      is discarded;
-    * if it exits **any other way** — a crash, a kill, `:shutdown` from a supervisor — the
-      tuple is returned to the space and offered to the next taker.
+  ### `lease: {:monitor, :ack}`
 
-  `:shutdown` requeues along with everything else. A supervisor stopping a worker part-way
-  through is orderly, but the work still did not happen.
+  Returns `{:ok, tuple, handle}`. The tuple is held until you call `Tuplex.ack/1` with the
+  handle, and **any** exit before that returns it to the space — a normal one included,
+  because without an acknowledgement nothing says the work was done.
 
-  The lease is bound to the **lifetime of the calling process**, and there is no separate
-  acknowledgement to send: finishing means exiting normally. So lease from a process whose
-  life is the piece of work — typically a `Task` per tuple — rather than from a long-lived
-  worker that takes many tuples in a loop, which would accumulate leases it never releases.
+  This is the one to reach for by default. It is the only form that suits a worker taking
+  many tuples over its life, because the lease ends when the work does rather than when the
+  process does.
+
+      {:ok, job, handle} = Tuplex.in({:job, :_}, lease: {:monitor, :ack})
+      process(job)
+      Tuplex.ack(handle)
+
+  ### `lease: :monitor`
+
+  Returns `{:ok, tuple}`, unchanged from an unleased take. The tuple is held for the
+  **lifetime of the calling process**: a normal exit discards it, any other exit returns it.
+
+  That makes it right for callers whose lifetime *is* the unit of work — a `Task` per tuple
+  — and wrong for anything longer-lived. A worker that takes 500 tuples this way holds 500
+  live leases, and a crash at the 501st requeues all of them, including the 499 it had
+  already finished. Use `{:monitor, :ack}` there.
+
+      Task.async(fn ->
+        {:ok, job} = Tuplex.in({:job, :_}, lease: :monitor)
+        process(job)
+        # exiting normally here discards the tuple; crashing returns it to the space
+      end)
+
+  ### Both forms
+
+  `:shutdown` and `{:shutdown, _}` requeue along with every other abnormal reason. A
+  supervisor stopping a worker part-way through is orderly, but the work still did not
+  happen.
 
   A requeued tuple goes to the **back** of the queue, not back to its original position.
   That is deliberate: at the front, a tuple that crashes whoever takes it would be handed
   straight back to the next taker in a tight loop. At the back it starves instead, which is
   visible rather than fatal.
 
-  Leased tuples are invisible to `rd/2`, `rdp/1` and other `in/2` callers while they are
-  held.
-
-      Task.async(fn ->
-        {:ok, job} = Tuplex.in({:job, :_}, lease: true)
-        process(job)
-        # exiting normally here discards the tuple; crashing returns it to the space
-      end)
+  Leased tuples are invisible to `rd/2`, `rdp/1`, `rd_all/1` and other `in/2` callers while
+  they are held.
 
   ## The name
 
@@ -139,7 +161,7 @@ defmodule Tuplex do
       #=> {:error, :timeout}
   """
   @spec unquote(:in)(Template.template(), keyword()) ::
-          {:ok, Template.t()} | {:error, :timeout}
+          {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | {:error, :timeout}
   def unquote(:in)(template, opts \\ []) do
     template = Template.validate!(template)
     blocking(:in, template, timeout!(opts), lease!(opts))
@@ -170,7 +192,8 @@ defmodule Tuplex do
   @doc """
   An alias for `in/2`, for callers who would rather not work around the operator name.
   """
-  @spec take(Template.template(), keyword()) :: {:ok, Template.t()} | {:error, :timeout}
+  @spec take(Template.template(), keyword()) ::
+          {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | {:error, :timeout}
   defdelegate take(template, opts \\ []), to: __MODULE__, as: :in
 
   @doc """
@@ -197,7 +220,8 @@ defmodule Tuplex do
 
     * `:lease` — as for `in/2`.
   """
-  @spec inp(Template.template(), keyword()) :: {:ok, Template.t()} | :empty
+  @spec inp(Template.template(), keyword()) ::
+          {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | :empty
   def inp(template, opts \\ []) do
     template = Template.validate!(template)
     Shard.take(template, lease!(opts))
@@ -246,33 +270,202 @@ defmodule Tuplex do
   @spec tags() :: [atom()]
   defdelegate tags(), to: Shard
 
+  @doc """
+  Returns every tuple matching `template`, oldest first, leaving them all in place.
+
+  Runs in the calling process, like `rdp/1`, and carries the same caveat: the list is a
+  snapshot, and any of it may be taken by somebody else before you act on it. Identical
+  tuples appear once each. Tuples currently held under a lease are not included.
+
+  ## Examples
+
+      Tuplex.out({:job, 1})
+      Tuplex.out({:job, 2})
+      Tuplex.rd_all({:job, :_})
+      #=> [{:job, 1}, {:job, 2}]
+  """
+  @spec rd_all(Template.template()) :: [Template.t()]
+  def rd_all(template) do
+    template = Template.validate!(template)
+    Shard.read_all(template)
+  end
+
+  @doc """
+  Releases a tuple held under a `{:monitor, :ack}` lease.
+
+  `handle` is the third element returned by `in/2` or `inp/2` in that mode. Returns `:ok`
+  whether or not the lease is still held, so acknowledging twice, or acknowledging one that
+  has already expired, is harmless rather than an error.
+  """
+  @spec ack(Shard.handle()) :: :ok
+  defdelegate ack(handle), to: Shard
+
+  @doc """
+  Subscribes the calling process to tuples matching `template`, as they happen.
+
+  Returns `{:ok, ref}`. Messages arrive as:
+
+      {Tuplex.Shard, :watch, ref, event, tuple}
+
+  Watching is **observational**, like `rd/2` and unlike `in/2`: a watcher never consumes,
+  and every matching watcher hears about a tuple even when a blocked `in/2` takes it in the
+  same instant. That works because a tuple is written to the table before anything is
+  served, so what watchers are told about genuinely existed in the space.
+
+  Unlike a blocking read, a subscription is standing: it stays until `unwatch/1`, until the
+  subscriber dies, or until the node does. It survives its shard crashing.
+
+  ## Options
+
+    * `:events` — which events to receive, default `[:out]`. Also available are `:in`, for
+      tuples being consumed, and `:requeue`, for leased tuples returning to the space after
+      their holder failed. `:in` roughly doubles the volume on a busy tag and most watchers
+      do not want it, which is why it is off by default.
+
+    * `:max_queue` — drop threshold, default `#{@default_max_queue}`. See below.
+
+  ## Watching is lossy, on purpose
+
+  A watcher is pushed at, never asked, so nothing about how fast it can keep up reaches the
+  shard. An unbounded send to a subscriber slower than the space is an unbounded mailbox
+  that the shard can neither see nor recover from, and the node dies of it.
+
+  So the subscriber's queue is measured before each send, and anything past `:max_queue` is
+  **dropped**, with a `[:tuplex, :watch, :dropped]` telemetry event to say so. A debug
+  console that quietly takes the node down with it is worse than one that misses events and
+  tells you.
+
+  If you need every tuple, you need `in/2` — a consumer that applies backpressure by
+  existing — not a watcher.
+
+  ## Examples
+
+      {:ok, ref} = Tuplex.watch({:job, :_})
+      Tuplex.out({:job, 1})
+      #=> receives {Tuplex.Shard, :watch, ref, :out, {:job, 1}}
+  """
+  @spec watch(Template.template(), keyword()) :: {:ok, reference()} | {:error, term()}
+  def watch(template, opts \\ []) do
+    template = Template.validate!(template)
+    {tag, _arity} = Template.key(template)
+
+    spec = %{
+      ref: make_ref(),
+      tag: tag,
+      template: template,
+      events: events!(opts),
+      subscriber: Keyword.get(opts, :subscriber, self()),
+      max_queue: Keyword.get(opts, :max_queue, @default_max_queue)
+    }
+
+    with {:ok, _pid} <- Watch.start(spec), do: {:ok, spec.ref}
+  end
+
+  @doc """
+  Ends the subscription `ref`. Returns `:ok` even if it has already ended.
+  """
+  @spec unwatch(reference()) :: :ok
+  defdelegate unwatch(ref), to: Watch, as: :stop
+
+  @doc """
+  Runs `fun` in a fresh process and writes its result into the space.
+
+  Returns `{:ok, pid}` immediately. This is Linda's `eval`: a way to say "the tuple is the
+  result of this computation" without the caller waiting on it.
+
+  > #### eval has no failure channel {: .warning}
+  >
+  > If `fun` raises, or returns something that is not a valid tuple, **nothing is written
+  > and no one is told**. There is deliberately no error tuple: the arity of what `eval`
+  > produces is whatever `fun` returns, so an error result would have no predictable shape
+  > for a consumer to match against.
+  >
+  > A failure emits `[:tuplex, :eval, :exception]` telemetry and crashes its own process,
+  > which is visible in logs and metrics but not in the space. So `eval/2` is for computing
+  > a **tuple's contents**, not for work whose completion matters. If a consumer needs to
+  > know the work happened, have it wait on the tuple with `in/2` and give the producer a
+  > lease.
+
+  ## Examples
+
+      Tuplex.eval(fn -> {:report, expensive_calculation()} end)
+      #=> {:ok, #PID<0.123.0>}
+  """
+  @spec eval((-> Template.t())) :: {:ok, pid()}
+  def eval(fun) when is_function(fun, 0) do
+    Task.Supervisor.start_child(Tuplex.EvalSupervisor, fn -> evaluate(fun) end)
+  end
+
   # -- internals --------------------------------------------------------------
 
   # A single funnel per operation, so that step 6 can wrap each one in a telemetry span at
   # one call site instead of threading events through several early returns.
-  defp blocking(mode, template, 0, lease?) do
+  defp blocking(mode, template, 0, lease) do
     # A zero timeout is the non-blocking probe. Registering a waiter only to sweep it in the
     # same breath would cost two shard calls and a monitor to reach the same answer.
-    case probe(mode, template, lease?) do
+    case probe(mode, template, lease) do
       {:ok, tuple} -> {:ok, tuple}
+      {:ok, tuple, handle} -> {:ok, tuple, handle}
       :empty -> {:error, :timeout}
     end
   end
 
-  defp blocking(mode, template, timeout, lease?) do
-    Shard.wait(mode, template, timeout, lease?)
+  defp blocking(mode, template, timeout, lease) do
+    Shard.wait(mode, template, timeout, lease)
   end
 
-  defp probe(:in, template, lease?), do: Shard.take(template, lease?)
-  defp probe(:rd, template, _lease?), do: Shard.read(template)
+  defp probe(:in, template, lease), do: Shard.take(template, lease)
+  defp probe(:rd, template, _lease), do: Shard.read(template)
 
   defp lease!(opts) do
     case Keyword.get(opts, :lease, false) do
-      lease? when is_boolean(lease?) ->
-        lease?
+      false ->
+        false
+
+      :monitor ->
+        :monitor
+
+      {:monitor, :ack} ->
+        {:monitor, :ack}
 
       other ->
-        raise ArgumentError, ":lease must be true or false, got: #{inspect(other)}"
+        raise ArgumentError,
+              ":lease must be false, :monitor, or {:monitor, :ack}, got: #{inspect(other)}"
+    end
+  end
+
+  # The failure is reported and then re-raised, so it lands in the logs as a crash as well
+  # as in telemetry. A :kill cannot be caught and so goes unreported; nothing can help that.
+  defp evaluate(fun) do
+    out(fun.())
+  catch
+    kind, reason ->
+      stacktrace = __STACKTRACE__
+
+      :telemetry.execute(
+        [:tuplex, :eval, :exception],
+        %{count: 1},
+        %{kind: kind, reason: reason, stacktrace: stacktrace}
+      )
+
+      :erlang.raise(kind, reason, stacktrace)
+  end
+
+  defp known_event?(:out), do: true
+  defp known_event?(:in), do: true
+  defp known_event?(:requeue), do: true
+  defp known_event?(_other), do: false
+
+  defp events!(opts) do
+    case Keyword.get(opts, :events, [:out]) do
+      events when is_list(events) and events != [] ->
+        case Enum.reject(events, &known_event?/1) do
+          [] -> events
+          bad -> raise ArgumentError, "unknown watch events: #{inspect(bad)}"
+        end
+
+      other ->
+        raise ArgumentError, ":events must be a non-empty list, got: #{inspect(other)}"
     end
   end
 

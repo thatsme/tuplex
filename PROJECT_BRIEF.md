@@ -71,10 +71,7 @@ alexdont, 0.3.5, ~12k downloads. Hence the rename to Tuplex. Both `tuplex` and
 - `watch/2` — subscribe to tuples matching a template as they are written
 - **leases** — `in`/`inp` can hold a tuple against the taking process via `Process.monitor`
   rather than removing it outright, returning it to the space if that process dies without
-  finishing. (The first session's notes described this the other way round, as an `out`
-  option removing a tuple when its *writer* died. That is a different feature — a
-  self-expiring lock rather than at-least-once delivery — and is not built. Worth a ruling
-  on whether it is still wanted.)
+  finishing
 - **tag-based shard partitioning** — the tuple's first element selects the shard
 - **telemetry** — `:telemetry` events on the operations above
 
@@ -93,13 +90,35 @@ An empty module named after a future feature is worse than nothing.
 
 Scope discipline is a first-class requirement on this project, not a nice-to-have.
 
+### Sketched for v0.2 — do not build
+
+Recorded here only so the next design pass does not have to rediscover the shape.
+
+**Ephemeral tuples.** `out({:crane_available, 3, caps}, ephemeral: true)` — a tuple that
+vanishes when the process that declared it dies. Presence and service discovery: the tuple
+*is* the declaration, so it should not outlive the declarer.
+
+This is **not** a lease and the brief should never call it one. A lease requeues on death
+because the work was not done; an ephemeral tuple is deleted on death because the claim it
+represents is no longer true. Opposite behaviours.
+
+It also does not disturb the arity trick that keeps leased rows invisible, because it must
+not: an ephemeral tuple has to stay *readable* while its declarer lives, so it cannot be
+marked in the row at all. It wants a side map in shard state, `seq => {ref, pid}`, with the
+row left as a plain 2-tuple and `:DOWN` deleting by `seq`.
+
+**Requeue counts**, for the poison-tuple detector, want the same mechanism for the same
+reason: the count has to survive into a *free* row, and a free row cannot carry a third
+element without breaking the read path. A side map keyed by `seq` is where both belong.
+
 ## 5. Public API shape
 
 The module `Tuplex` is the only public surface. Everything else is internal.
 
 ```elixir
 Tuplex.out({:job, 1, "payload"})               # :ok
-Tuplex.in({:job, :_}, lease: true)             # comes back if the taker dies
+Tuplex.in({:job, :_}, lease: :monitor)         # comes back if the taker dies
+Tuplex.in({:job, :_}, lease: {:monitor, :ack}) # {:ok, tuple, handle}; Tuplex.ack(handle)
 
 Tuplex.in({:job, :_, :_})                      # blocks: {:ok, tuple} | {:error, :timeout}
 Tuplex.in({:job, :_, :_}, timeout: 5_000)
@@ -109,8 +128,8 @@ Tuplex.inp({:job, :_, :_})                     # never blocks: {:ok, tuple} | :e
 Tuplex.rdp({:job, :_, :_})                     # never blocks: {:ok, tuple} | :empty
 Tuplex.rd_all({:job, :_, :_})                  # [tuple] — possibly []
 
-Tuplex.eval(fn -> {:result, expensive()} end)  # {:ok, pid}
-Tuplex.watch({:job, :_, :_})                   # :ok — messages to the caller
+Tuplex.eval(fn -> {:result, expensive()} end)  # {:ok, pid} — no failure channel
+Tuplex.watch({:job, :_, :_})                   # {:ok, ref} — messages to the caller
 
 Tuplex.tags()                                  # [atom] — live shard tags
 ```
@@ -427,14 +446,27 @@ requeue count for a later poison detector would have to survive the requeue, mea
 would have to live in the *free* row, which changes the arity guard. Deliberately deferred
 rather than half-built.
 
-**Only `:normal` discards.** Every other exit reason requeues, `:shutdown` and
-`{:shutdown, _}` included: a supervisor stopping a worker mid-lease is orderly, but the
-work still did not happen. A worker that finished should exit normally, or the lease was
-the wrong tool.
+**Only `:normal` discards** — in `:monitor` mode. Every other exit reason requeues,
+`:shutdown` and `{:shutdown, _}` included: a supervisor stopping a worker mid-lease is
+orderly, but the work still did not happen.
 
-The lease is bound to the calling process's lifetime and there is no separate
-acknowledgement, so callers should lease from a process whose life *is* the piece of work —
-a `Task` per tuple — not from a long-lived worker looping over many.
+### Two lease modes, because process lifetime is not always the unit of work
+
+`lease: :monitor` binds the lease to the caller's lifetime. That is right when the caller's
+life *is* the piece of work — a `Task` per tuple — and quietly wrong for anything
+longer-lived. A worker taking 500 tuples over its life holds 500 live leases, and a crash at
+the 501st requeues all of them, 499 of which were finished. That is not a papercut but a
+silent violation of the exactly-once claim the library rests on, and "use a Task per tuple"
+is a workaround that puts the burden on whoever did not read that far.
+
+So `lease: {:monitor, :ack}` returns `{:ok, tuple, handle}` and holds the tuple until
+`Tuplex.ack/1`. **Any** exit before that requeues, a normal one included, because without
+an acknowledgement nothing says the work was done. Varying the return shape by an option
+that literally says `:ack` is defensible; changing `:monitor`'s shape would not have been,
+so it is untouched.
+
+The mode travels in the row, not just in shard state, so a shard reclaiming a table after a
+crash knows how each held tuple is meant to be settled.
 
 ### The three-write requeue
 
@@ -458,6 +490,48 @@ One window is at-least-once rather than exactly-once and cannot be closed: a hol
 finished and exited normally *while the shard was down* leaves no record of why it exited,
 so its tuple is requeued as though the work had failed. Losing it instead would be worse.
 
+### Watching
+
+`watch/2` files a template in shard state alongside the waiters, matched at the same funnel
+point, so ordering comes for free. A watch is **non-consuming and persistent**: it does not
+take, and it stays until `unwatch/1`, the subscriber dies, or the node does.
+
+Watchers are observational like `rd`, so they hear about a tuple even when an `in` waiter
+consumes it in the same instant — the insert-before-serve rule is what makes that true
+rather than a lie.
+
+Three things this needs that a blocking read does not:
+
+- **Surviving shard death.** A watcher is not sitting in a call, so it cannot re-register
+  the way a blocked caller does. `Tuplex.Watch` is a small supervised process per
+  subscription that holds the ref, monitors both the shard and the subscriber, and registers
+  again with the replacement. Events go from shard to subscriber directly; the Watch process
+  is only the registration's keeper, so a slow subscriber cannot back up behind it.
+
+- **Backpressure, or the honest lack of it.** A watcher is pushed at and never asked, so an
+  unbounded send to a slow subscriber is an unbounded mailbox the shard cannot see. The
+  subscriber's queue is measured before each send and anything past `:max_queue` is dropped,
+  with `[:tuplex, :watch, :dropped]` telemetry. **Watching is lossy and documented as
+  lossy.** A debug console that quietly takes the node down with it is worse than one that
+  misses events and says so. A caller that needs every tuple needs `in/2` — a consumer that
+  applies backpressure by existing.
+
+- **A small event set.** `events: [:out]` by default, with `:in` and `:requeue` available.
+  `:in` roughly doubles the volume on a busy tag and most watchers do not want it.
+
+### `eval` has no failure channel
+
+If the function raises, nothing is written and nobody is told. That is not an oversight and
+it must not be patched with an error tuple: the arity of what `eval` produces is whatever
+the function returns, so an error result would have no predictable shape for a consumer to
+match against.
+
+Instead the failure emits `[:tuplex, :eval, :exception]` and crashes its own supervised
+process, which is visible in logs and metrics but not in the space. `eval/1` is for
+computing a **tuple's contents**, not for work whose completion matters — which is what it
+was in Linda too. A consumer that needs to know the work happened should wait on the tuple
+and the producer should hold a lease.
+
 ### The key invariant
 
 ```
@@ -478,7 +552,7 @@ the project; there is no partial credit for a half-finished layer.
 2. `Tuplex.Shard` + `Tuplex.Registry` — `out`, `inp`, `rdp`, `tags` — **done**
 3. Blocking `in` / `rd` with the waiter index — **done**
 4. Leases + `Tuplex.TableKeeper` — **done**
-5. `watch`, `eval`, `rd_all`
+5. `watch`, `eval`, `rd_all` — **done**
 6. **Telemetry**, as one pass over the complete surface
 7. Property tests (PropEr, stateful)
 8. README and docs

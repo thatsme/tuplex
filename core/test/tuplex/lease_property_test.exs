@@ -78,7 +78,7 @@ defmodule Tuplex.LeasePropertyTest do
     parent = self()
 
     spawn(fn ->
-      send(parent, {:took, self(), Tuplex.inp({tag, :_}, lease: true)})
+      send(parent, {:took, self(), Tuplex.inp({tag, :_}, lease: :monitor)})
 
       receive do
         :retire -> exit(:normal)

@@ -235,7 +235,7 @@ defmodule Tuplex.WaiterTest do
 
       state = :sys.get_state(shard)
       assert state.waiters == %{}
-      assert state.index == %{}
+      assert state.waiter_index == %{}
       assert state.monitors == %{}
     end
   end

@@ -24,7 +24,17 @@ defmodule Tuplex.Application do
       # cap is raised rather than removed so a shard that genuinely cannot start still gives
       # up instead of spinning.
       {DynamicSupervisor,
-       name: Tuplex.ShardSupervisor, strategy: :one_for_one, max_restarts: 100, max_seconds: 5}
+       name: Tuplex.ShardSupervisor, strategy: :one_for_one, max_restarts: 100, max_seconds: 5},
+
+      # One process per watch subscription, holding the registration alive across shard
+      # restarts. A watcher is not sitting in a call, so it cannot re-register for itself.
+      {Registry, keys: :unique, name: Tuplex.WatchRegistry},
+      {DynamicSupervisor,
+       name: Tuplex.WatchSupervisor, strategy: :one_for_one, max_restarts: 100, max_seconds: 5},
+
+      # eval/2's processes, supervised so a computation that crashes is reported rather than
+      # silently orphaned.
+      {Task.Supervisor, name: Tuplex.EvalSupervisor}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Tuplex.Supervisor)
