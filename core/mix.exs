@@ -33,7 +33,8 @@ defmodule Tuplex.MixProject do
   defp deps do
     [
       {:telemetry, "~> 1.2"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end
 
@@ -41,7 +42,7 @@ defmodule Tuplex.MixProject do
     [
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md .formatter.exs)
+      files: ~w(lib mix.exs README.md LICENSE .formatter.exs)
     ]
   end
 

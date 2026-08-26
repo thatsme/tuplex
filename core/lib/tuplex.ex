@@ -1,18 +1,8 @@
 defmodule Tuplex do
   @moduledoc """
-  Documentation for `Tuplex`.
+  A Linda tuple space for the BEAM.
+
+  The public API lands here as the build progresses; see `PROJECT_BRIEF.md` for the
+  operations planned for v0.1 and the order they arrive in.
   """
-
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> Tuplex.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
 end

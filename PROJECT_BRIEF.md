@@ -107,7 +107,19 @@ Tuplex.rd_all({:job, :_, :_})                  # [tuple] — possibly []
 
 Tuplex.eval(fn -> {:result, expensive()} end)  # {:ok, pid}
 Tuplex.watch({:job, :_, :_})                   # :ok — messages to the caller
+
+Tuplex.tags()                                  # [atom] — live shard tags
 ```
+
+`inp/2` and `rdp/2` return `{:ok, tuple} | :empty`. The asymmetry with `in/2`'s
+`{:error, :timeout}` is meaningful rather than sloppy, and the docs must say so: an empty
+space is an ordinary state for a tuple space to be in, while a timeout is an exceptional
+one. Do not "regularise" this to `{:error, :empty}`.
+
+A template's tag must be a concrete atom — see §6. `tags/0` is the door out of that for the
+debugging case: it returns the live shard tags, and a caller who genuinely wants a
+whole-space sweep folds `rd_all/1` over it themselves. Fan-out then exists, its cost is
+visible at the call site, and it never leaks into the hot API.
 
 `take/2` is a formatter-friendly alias for `in/2`, via
 `defdelegate take(t, o), to: __MODULE__, as: :in`.
@@ -153,51 +165,107 @@ the correctness-critical part of this system cheap to test.
 
 ### Storage form
 
-Each shard owns one `:duplicate_bag` ETS table. The stored record is:
+Each shard owns one **`:ordered_set`** ETS table keyed by a monotonically increasing
+sequence number, with the counter living in the shard's own state:
 
 ```elixir
-{{tag, arity}, :erlang.unique_integer([:monotonic]), tuple}
+{seq, tuple}
 ```
 
-The middle **uniqueness field is MANDATORY, not decorative.** Verified empirically on
-OTP 28: in a `:duplicate_bag`, `:ets.delete_object/2` deletes **every** object equal to the
-one given. Storing bare tuples and using `delete_object` to implement a destructive `in`
-therefore removes *all* identical copies at once — insert a semaphore token three times,
-take once, and the table size drops to 0. The uniqueness integer makes every record
-distinct, so `delete_object` removes exactly one copy while identical user tuples still
-coexist and count separately.
+**`:duplicate_bag` keyed by `{tag, arity}` was the original plan and it is wrong.** A
+destructive read has to remove **exactly one** of N identical rows — that is the whole
+semaphore idiom, `out` a token three times and `in` it back one at a time — and a
+`:duplicate_bag` has no primitive that does it:
 
-This is a silent data-loss trap that unit tests written over distinct tuples would never
-catch. Test it with duplicates, explicitly.
+- `:ets.delete_object/2` deletes **every** object equal to the one given, so taking one
+  token drains all three at once. Verified on OTP 28.
+- `:ets.take/2` is no escape: it takes **by key**, and in a per-tag shard the key is the
+  tag, so a take removes the entire space.
 
-Note the `:duplicate_bag` choice stands, but for a different reason than first assumed: the
-key `{tag, arity}` is shared by many records, which is what rules out `:set`. Uniqueness
-comes from the integer, not from the table type.
+Giving every row a distinct key solves it outright — removing exactly one row is
+`:ets.delete(tab, seq)`.
+
+Nothing is lost by the move. Within a shard every tuple carries the same tag **by
+construction**, so a tag-keyed index selects everything and every match is a linear scan
+whatever the table type. The key index buys nothing, which is what frees the choice of
+table type to be made on other grounds. Two things are gained:
+
+- **FIFO for free.** `:ordered_set` traversal follows key order, so the first match is the
+  oldest match. Linda leaves the choice among matching tuples unspecified; predictable is
+  strictly more useful than arbitrary, at no cost.
+- O(log n) insert and delete, which is noise next to the O(n) scan they accompany.
+
+The duplicate-drain trap is silent data loss that tests written over distinct tuples would
+never catch. **Test it with identical tuples, explicitly.**
 
 ### Match specs
 
 Built **by hand**. `:ets.fun2ms` cannot see runtime template values and is useless here.
-The shape, verified on OTP 28:
+
+The work is split so that `Template` never learns the storage form. `Template.compile/1`
+returns a head shaped like the template plus any guards; `Store` nests that head under its
+own key position and supplies the body:
 
 ```elixir
-[{{{tag, arity}, :_, template}, [], [:"$_"]}]
+{head, guards} = Template.compile!(template)
+[{{:_, head}, guards, [:"$_"]}]
 ```
 
-Verified properties of this form:
+- `Store` contributes only `:_` for the `seq` position, never a numbered variable, so
+  `Template`'s `:"$1"`, `:"$2"`, … can never collide with anything `Store` introduces.
+- The body `[:"$_"]` returns the whole record, so a destructive read reads the `seq` back
+  out of the row it just matched and deletes by it.
+- **Tag and arity stay in the head**, so they are matched structurally and cheaply.
+- Matching is **exact**: `1.0` does not match a stored `1`, which is correct for Linda.
+- Destructive and single reads use **`:ets.select(tab, ms, 1)`**, not select-everything-
+  and-take-the-head. Early termination is what keeps a read on a shard holding real volume
+  from walking the whole table.
 
-- **arity is part of the match** — an arity-3 template never matches an arity-2 or arity-4
-  tuple, because arity is baked into the key
-- the template **doubles directly as the nested head pattern**; `:_` acts as the wildcard
-- matching is **exact**: `1.0` does not match a stored `1`, which is correct for Linda
-- `:ets.select(tab, ms, 1)` followed by `delete_object/2` takes exactly one copy of a
-  duplicated tuple
+### Maps in templates
+
+Maps are ordinary Elixir terms and templates carry them, but they are **never placed in the
+head**. ETS matches a map in a head *partially* — a `%{a: 1}` pattern matches a stored
+`%{a: 1, b: 2}` — which would put a second, contradictory notion of "match" alongside the
+exact one. Rejecting maps outright is a wider cut than the problem needs and would be a
+day-one papercut on something as ordinary as `{:job, %{region: :north}}`.
+
+So `compile/1` hoists the map-bearing subterm out of the head and pins it with an `=:=`
+guard:
+
+```elixir
+# {:job, :_, %{region: :north}}  compiles to
+{{:job, :_, :"$1"}, [{:"=:=", :"$1", {:const, %{region: :north}}}]}
+```
+
+`=:=` is exactly the equality the rest of the design promises. The hoist takes the largest
+**wildcard-free** subterm containing the map, so one guard usually covers a whole nested
+structure while wildcards elsewhere keep working.
+
+What is rejected is the narrow case: **a wildcard inside a map**, `%{a: :_}`. That needs
+the partial semantics back, nobody needs it in v0.1, and the error message is easy to
+write.
+
+Consequence for `$`-atoms: they are rejected only where they would reach the head. Inside a
+hoisted subterm they land in a `{:const, _}` and are never interpreted, so
+`{:cfg, %{name: :"$1"}}` is accepted.
+
+### The key invariant
+
+```
+if matches?(template, tuple) then key(template) == key(tuple)
+```
+
+`Shard` files waiting templates by `key/1` and offers a newly written tuple only to the
+waiters under the tuple's own key. If this ever fails, `out` looks in the wrong bucket and
+a legitimately waiting `in` is never woken — a hang, not a crash, and the worst thing in
+this codebase to debug. **Property-tested**, not merely exampled.
 
 ## 7. Build order
 
 **No step starts until the previous step's tests pass.** This is the whole discipline of
 the project; there is no partial credit for a half-finished layer.
 
-1. `Tuplex.Template` + `Tuplex.Store`, with full unit tests
+1. `Tuplex.Template` + `Tuplex.Store`, with full unit tests — **done**
 2. `Tuplex.Shard` — `out`, `inp`, `rdp`
 3. Blocking `in` / `rd` with the waiter index
 4. Leases + `Tuplex.TableKeeper`
@@ -205,13 +273,27 @@ the project; there is no partial credit for a half-finished layer.
 6. Property tests (PropEr, stateful)
 7. README and docs
 
-## 8. Decisions taken while writing this file
+## 8. Settled decisions
 
-These were not in the first session's notes and are open to correction:
+All ratified; no longer open.
 
-- `inp/2` and `rdp/2` return `{:ok, tuple} | :empty`. `:empty` is a normal outcome, not an
-  error, so it is not wrapped in `{:error, _}` the way `in/2`'s `:timeout` is.
-- `:_` and any `:"$..."` atom are **reserved in templates**. `Template` rejects a template
-  containing `:"$1"`-style atoms, because ETS would silently read them as match variables.
-  They remain legal inside tuples passed to `out/2` — storage does not interpret content.
-- `rd_all/2` returns a plain list, `[]` when nothing matches.
+- **`inp/2` / `rdp/2` return `{:ok, tuple} | :empty`.** Not `{:error, :empty}` — see §5.
+- **A template's tag must be a concrete atom.** The moment a wildcard tag is legal,
+  partitioning stops being a partition. `Tuplex.tags/0` is the explicit door for the debug
+  case.
+- **Maps are supported in templates via `=:=` guards**, and only a wildcard *inside* a map
+  is rejected. See §6.
+- **`rd_all/2`** returns a plain list, `[]` when nothing matches.
+- **License: Apache-2.0.** The patent grant is worth having for anything that might end up
+  inside an enterprise, and Apache-2.0 clears that kind of legal review without a
+  conversation. Elixir itself is Apache-2.0. The canonical `LICENSE` is at the repo root
+  and is copied into `core/` and `blackboard/` so each published package ships its own.
+
+## 9. Repo conventions
+
+- **Line endings are LF.** The root `.gitattributes` sets `* text=auto eol=lf`, which
+  overrides a contributor's global `core.autocrlf`. Do not commit CRLF.
+- `git remote origin` is `https://github.com/thatsme/tuplex.git` (private).
+- No placeholder code. The generator's `Tuplex.hello/0` was deleted rather than left to be
+  screenshotted; `Tuplex` carries a moduledoc and nothing else until it has real API to
+  carry.

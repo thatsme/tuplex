@@ -1,5 +1,6 @@
 defmodule Tuplex.TemplateTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias Tuplex.Template
 
@@ -42,7 +43,7 @@ defmodule Tuplex.TemplateTest do
       assert {:error, :empty_tuple} = Template.validate({})
     end
 
-    test "rejects $-prefixed atoms, which ETS would read as match variables" do
+    test "rejects $-prefixed atoms that would land in the head" do
       assert {:error, {:reserved_atom, :"$1"}} = Template.validate({:job, :"$1"})
       assert {:error, {:reserved_atom, :"$_"}} = Template.validate({:job, :"$_"})
       assert {:error, {:reserved_atom, :"$$"}} = Template.validate({:job, :"$$"})
@@ -60,18 +61,9 @@ defmodule Tuplex.TemplateTest do
       assert {:error, {:reserved_atom, :"$1"}} = Template.validate({:job, [1 | :"$1"]})
     end
 
-    test "rejects maps, which ETS matches only partially" do
-      assert {:error, {:map_in_template, %{a: 1}}} = Template.validate({:job, %{a: 1}})
-      assert {:error, {:map_in_template, %{}}} = Template.validate({:job, %{}})
-    end
-
-    test "finds maps nested inside tuples and lists" do
-      assert {:error, {:map_in_template, %{a: 1}}} = Template.validate({:job, {:inner, %{a: 1}}})
-      assert {:error, {:map_in_template, %{a: 1}}} = Template.validate({:job, [%{a: 1}]})
-    end
-
-    test "a struct is a map and is rejected too" do
-      assert {:error, {:map_in_template, %URI{}}} = Template.validate({:job, %URI{}})
+    test "allows reserved atoms inside a hoisted subterm, where ETS never reads them" do
+      assert {:ok, _} = Template.validate({:cfg, %{name: :"$1"}})
+      assert {:ok, _} = Template.validate({:cfg, {:"$1", %{a: 1}}})
     end
 
     test "atoms that merely contain a dollar sign are fine" do
@@ -80,12 +72,111 @@ defmodule Tuplex.TemplateTest do
     end
   end
 
-  describe "validate!/1" do
-    test "returns the template when valid" do
+  describe "validate/1 with maps" do
+    test "accepts maps, which are ordinary terms" do
+      assert {:ok, _} = Template.validate({:job, %{region: :north}})
+      assert {:ok, _} = Template.validate({:job, :_, %{region: :north}})
+      assert {:ok, _} = Template.validate({:job, %{}})
+      assert {:ok, _} = Template.validate({:job, %URI{}})
+    end
+
+    test "accepts maps nested inside tuples and lists" do
+      assert {:ok, _} = Template.validate({:job, {:inner, %{a: 1}}})
+      assert {:ok, _} = Template.validate({:job, [%{a: 1}, %{b: 2}]})
+      assert {:ok, _} = Template.validate({:job, %{outer: %{inner: 1}}})
+    end
+
+    test "rejects a wildcard inside a map" do
+      assert {:error, {:wildcard_in_map, %{a: :_}}} = Template.validate({:job, %{a: :_}})
+    end
+
+    test "rejects a wildcard nested deeper inside a map" do
+      assert {:error, {:wildcard_in_map, %{a: {1, :_}}}} =
+               Template.validate({:job, %{a: {1, :_}}})
+
+      assert {:error, {:wildcard_in_map, %{a: [1, :_]}}} =
+               Template.validate({:job, %{a: [1, :_]}})
+    end
+
+    test "rejects a wildcard used as a map key" do
+      map = %{:_ => 1}
+      assert {:error, {:wildcard_in_map, ^map}} = Template.validate({:job, map})
+    end
+
+    test "rejects a wildcard in a map nested inside other structure" do
+      assert {:error, {:wildcard_in_map, %{a: :_}}} =
+               Template.validate({:job, {:inner, %{a: :_}}})
+
+      assert {:error, {:wildcard_in_map, %{a: :_}}} = Template.validate({:job, [%{a: :_}]})
+    end
+
+    test "a wildcard beside a map is fine — only inside one is a problem" do
+      assert {:ok, _} = Template.validate({:job, :_, %{a: 1}})
+      assert {:ok, _} = Template.validate({:job, {:_, %{a: 1}}})
+      assert {:ok, _} = Template.validate({:job, [:_, %{a: 1}]})
+    end
+  end
+
+  describe "compile/1" do
+    test "a map-free template compiles to itself with no guards" do
+      assert {:ok, {{:job, :_, 2}, []}} = Template.compile({:job, :_, 2})
+      assert {:ok, {{:ping}, []}} = Template.compile({:ping})
+    end
+
+    test "hoists a map into an equality guard" do
+      assert {:ok, {{:job, :_, :"$1"}, [{:"=:=", :"$1", {:const, %{region: :north}}}]}} =
+               Template.compile({:job, :_, %{region: :north}})
+    end
+
+    test "hoists the largest wildcard-free subterm, not just the map" do
+      assert {:ok, {{:job, :"$1"}, [{:"=:=", :"$1", {:const, {:meta, %{a: 1}, 2}}}]}} =
+               Template.compile({:job, {:meta, %{a: 1}, 2}})
+    end
+
+    test "descends past a wildcard to reach the map beside it" do
+      assert {:ok, {{:job, {:_, :"$1"}}, [{:"=:=", :"$1", {:const, %{a: 1}}}]}} =
+               Template.compile({:job, {:_, %{a: 1}}})
+    end
+
+    test "numbers several hoisted subterms in order" do
+      assert {:ok, {{:job, :"$1", :_, :"$2"}, guards}} =
+               Template.compile({:job, %{a: 1}, :_, %{b: 2}})
+
+      assert [{:"=:=", :"$1", {:const, %{a: 1}}}, {:"=:=", :"$2", {:const, %{b: 2}}}] = guards
+    end
+
+    test "keeps tag and arity in the head even when everything else is hoisted" do
+      assert {:ok, {{:job, :"$1"}, _}} = Template.compile({:job, %{a: 1}})
+    end
+
+    test "hoists a map inside a list" do
+      assert {:ok, {{:job, [1, :_, :"$1"]}, [{:"=:=", :"$1", {:const, %{a: 1}}}]}} =
+               Template.compile({:job, [1, :_, %{a: 1}]})
+    end
+
+    test "hoists a whole map-bearing list when nothing in it is wildcarded" do
+      assert {:ok, {{:job, :"$1"}, [{:"=:=", :"$1", {:const, [1 | %{a: 1}]}}]}} =
+               Template.compile({:job, [1 | %{a: 1}]})
+    end
+
+    test "hoists a map in an improper list tail when the list is wildcarded" do
+      assert {:ok, {{:job, [:_ | :"$1"]}, [{:"=:=", :"$1", {:const, %{a: 1}}}]}} =
+               Template.compile({:job, [:_ | %{a: 1}]})
+    end
+
+    test "propagates validation errors" do
+      assert {:error, :wildcard_tag} = Template.compile({:_, 1})
+      assert {:error, {:wildcard_in_map, %{a: :_}}} = Template.compile({:job, %{a: :_}})
+    end
+  end
+
+  describe "compile!/1 and validate!/1" do
+    test "return on success" do
+      assert {{:job, :_}, []} = Template.compile!({:job, :_})
       assert {:job, :_} = Template.validate!({:job, :_})
     end
 
-    test "raises with an explanation when invalid" do
+    test "raise with an explanation" do
       assert_raise ArgumentError, ~r/the tag may not be the wildcard/, fn ->
         Template.validate!({:_, 1})
       end
@@ -94,8 +185,8 @@ defmodule Tuplex.TemplateTest do
         Template.validate!({:job, :"$1"})
       end
 
-      assert_raise ArgumentError, ~r/maps are not supported/, fn ->
-        Template.validate!({:job, %{a: 1}})
+      assert_raise ArgumentError, ~r/wildcards inside maps/, fn ->
+        Template.compile!({:job, %{a: :_}})
       end
     end
   end
@@ -115,11 +206,10 @@ defmodule Tuplex.TemplateTest do
     end
 
     test "stored content is data, so terms illegal in a template are allowed" do
-      assert {:ok, _} = Template.validate_tuple({:cfg, %{retries: 3}})
+      assert {:ok, _} = Template.validate_tuple({:cfg, %{a: :_}})
       assert {:ok, _} = Template.validate_tuple({:cfg, :"$1"})
       assert {:ok, _} = Template.validate_tuple({:cfg, :_})
       assert {:ok, _} = Template.validate_tuple({:cfg, [%{a: 1}, :"$99"]})
-      assert {:ok, _} = Template.validate_tuple({:cfg, %URI{}})
     end
   end
 
@@ -136,18 +226,6 @@ defmodule Tuplex.TemplateTest do
 
     test "differing arity gives a differing key" do
       refute Template.key({:job, 1}) == Template.key({:job, 1, 2})
-    end
-  end
-
-  describe "match_spec/1" do
-    test "wraps the template as a nested head pattern and returns the whole record" do
-      assert [{{{:job, 3}, :_, {:job, :_, 2}}, [], [:"$_"]}] =
-               Template.match_spec({:job, :_, 2})
-    end
-
-    test "is accepted by ETS" do
-      tab = new_table()
-      assert [] = :ets.select(tab, Template.match_spec({:job, :_, :_}))
     end
   end
 
@@ -186,6 +264,13 @@ defmodule Tuplex.TemplateTest do
       assert Template.matches?({:n, 1.0}, {:n, 1.0})
     end
 
+    test "maps match by equality, never as a subset" do
+      assert Template.matches?({:cfg, %{a: 1}}, {:cfg, %{a: 1}})
+      refute Template.matches?({:cfg, %{a: 1}}, {:cfg, %{a: 1, b: 2}})
+      refute Template.matches?({:cfg, %{a: 1, b: 2}}, {:cfg, %{a: 1}})
+      refute Template.matches?({:cfg, %{a: 1}}, {:cfg, %{a: 1.0}})
+    end
+
     test "lists of differing length do not match" do
       refute Template.matches?({:list, [1, 2]}, {:list, [1, 2, 3]})
       refute Template.matches?({:list, [1, 2, 3]}, {:list, [1, 2]})
@@ -209,112 +294,90 @@ defmodule Tuplex.TemplateTest do
     end
   end
 
-  # The pure matcher and the ETS match spec must express exactly the same relation. If they
-  # ever drift, blocking reads (which use the pure matcher against waiting templates) would
-  # disagree with table reads about what is in the space.
-  describe "matches?/2 agrees with the ETS match spec" do
-    @corpus [
-      {:job, 1, "a"},
-      {:job, 1, "b"},
-      {:job, 2, "a"},
-      {:job, 1.0, "a"},
-      {:job, 1, "a"},
-      {:job, 1},
-      {:job, 1, 2, 3},
-      {:point, {:x, 1}},
-      {:point, {:x, 2}},
-      {:point, {:y, 1}},
-      {:point, {:x, 1, 2}},
-      {:list, [1, 2, 3]},
-      {:list, [1, :b, 3]},
-      {:list, [1, 2]},
-      {:list, []},
-      {:list, [1 | :tail]},
-      {:ping},
-      {:flag, true},
-      {:flag, false},
-      {:s, "ab"},
-      {:s, ~c"ab"},
-      {:bin, <<1, 2>>},
-      {:bin, <<1, 2, 3>>},
-      {:mixed, :_, 1},
-      {:mixed, :other, 1},
-      {:cfg, %{a: 1}},
-      {:cfg, %{a: 1, b: 2}}
-    ]
+  # If a template can match a tuple, the two must file under the same key. Shard indexes
+  # waiting templates by key and only offers a newly written tuple to the waiters under the
+  # tuple's own key — so a disagreement here means `out` looks in the wrong bucket and a
+  # legitimately waiting `in` is never woken. That failure is a hang, not a crash, which
+  # makes it the worst thing in this codebase to debug and worth a property rather than
+  # examples.
+  describe "property: matching implies equal keys" do
+    property "for templates derived from a tuple by wildcarding" do
+      check all(
+              tuple <- tuple_gen(),
+              template <- wildcarded(tuple)
+            ) do
+        assert Template.matches?(template, tuple),
+               "wildcarding should only ever widen a match"
 
-    @templates [
-      {:job, :_, :_},
-      {:job, 1, :_},
-      {:job, 1.0, :_},
-      {:job, :_, "a"},
-      {:job, 1, "a"},
-      {:job, :_},
-      {:job, :_, :_, :_},
-      {:point, {:x, :_}},
-      {:point, :_},
-      {:point, {:_, 1}},
-      {:list, [1, :_, 3]},
-      {:list, [1, 2]},
-      {:list, []},
-      {:list, :_},
-      {:list, [1 | :_]},
-      {:ping},
-      {:flag, true},
-      {:flag, :_},
-      {:s, "ab"},
-      {:s, ~c"ab"},
-      {:bin, <<1, 2>>},
-      {:mixed, :_, :_},
-      {:mixed, :_, 1},
-      {:cfg, :_},
-      {:absent, :_}
-    ]
-
-    setup do
-      tab = new_table()
-
-      for tuple <- @corpus do
-        :ets.insert(tab, {Template.key(tuple), :erlang.unique_integer([:monotonic]), tuple})
-      end
-
-      {:ok, tab: tab}
-    end
-
-    for template <- @templates do
-      test "#{inspect(template)}", %{tab: tab} do
-        template = unquote(Macro.escape(template))
-
-        assert {:ok, ^template} = Template.validate(template)
-
-        from_ets =
-          tab
-          |> :ets.select(Template.match_spec(template))
-          |> Enum.map(&elem(&1, 2))
-          |> Enum.sort()
-
-        from_pure =
-          @corpus
-          |> Enum.filter(&Template.matches?(template, &1))
-          |> Enum.sort()
-
-        assert from_ets == from_pure
+        assert Template.key(template) == Template.key(tuple)
       end
     end
 
-    test "duplicates are preserved on both sides", %{tab: tab} do
-      # {:job, 1, "a"} appears twice in the corpus.
-      from_ets = :ets.select(tab, Template.match_spec({:job, 1, "a"}))
-      from_pure = Enum.filter(@corpus, &Template.matches?({:job, 1, "a"}, &1))
+    property "for independently generated templates and tuples" do
+      check all(
+              tuple <- tuple_gen(),
+              other <- tuple_gen(),
+              template <- wildcarded(other)
+            ) do
+        if Template.matches?(template, tuple) do
+          assert Template.key(template) == Template.key(tuple)
+        end
+      end
+    end
 
-      assert length(from_ets) == 2
-      assert length(from_pure) == 2
+    property "a compiled template still agrees with key/1" do
+      check all(
+              tuple <- tuple_gen(),
+              template <- wildcarded(tuple)
+            ) do
+        assert {:ok, {head, _guards}} = Template.compile(template)
+        assert tuple_size(head) == tuple_size(tuple)
+        assert elem(head, 0) == elem(tuple, 0)
+      end
     end
   end
 
-  defp new_table do
-    tab = :ets.new(:tuplex_template_test, [:duplicate_bag, :public])
-    on_exit(fn -> if :ets.info(tab) != :undefined, do: :ets.delete(tab) end)
-    tab
+  # -- generators -------------------------------------------------------------
+
+  defp tag_gen, do: StreamData.member_of([:job, :task, :point, :cfg, :ping])
+
+  defp leaf_gen do
+    StreamData.one_of([
+      StreamData.integer(),
+      StreamData.float(),
+      StreamData.binary(),
+      StreamData.member_of([:a, :b, true, false, nil, ~c"ab", "ab"])
+    ])
+  end
+
+  defp term_gen do
+    StreamData.tree(leaf_gen(), fn child ->
+      StreamData.one_of([
+        StreamData.list_of(child, max_length: 3),
+        StreamData.map(StreamData.list_of(child, max_length: 3), &List.to_tuple/1),
+        StreamData.map(StreamData.list_of(child, max_length: 2), fn terms ->
+          Map.new(Enum.with_index(terms), fn {term, index} -> {index, term} end)
+        end)
+      ])
+    end)
+  end
+
+  defp tuple_gen do
+    StreamData.bind(tag_gen(), fn tag ->
+      StreamData.map(StreamData.list_of(term_gen(), max_length: 3), fn terms ->
+        List.to_tuple([tag | terms])
+      end)
+    end)
+  end
+
+  # Replaces a random subset of the tuple's top-level elements with the wildcard. The tag is
+  # never replaced, since a wildcard tag is not a legal template.
+  defp wildcarded(tuple) do
+    [tag | terms] = Tuple.to_list(tuple)
+
+    terms
+    |> Enum.map(fn term -> StreamData.member_of([term, :_]) end)
+    |> StreamData.fixed_list()
+    |> StreamData.map(fn chosen -> List.to_tuple([tag | chosen]) end)
   end
 end
