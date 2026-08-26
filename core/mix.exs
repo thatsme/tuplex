@@ -43,17 +43,20 @@ defmodule Tuplex.MixProject do
     [
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md LICENSE .formatter.exs)
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs)
     ]
   end
 
   defp docs do
     [
       main: "readme",
+      groups_for_modules: [
+        Internal: [Tuplex.Store, Tuplex.Template]
+      ],
       markdown_processor: {ExDoc.Markdown.Earmark, [footnotes: true]},
       source_url: @source_url,
       source_ref: "v#{@version}",
-      extras: ["README.md"]
+      extras: ["README.md", "CHANGELOG.md", "test/MUTATION_LOG.md"]
     ]
   end
 end

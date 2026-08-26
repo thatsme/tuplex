@@ -1,18 +1,20 @@
 defmodule Tuplex.Watch do
-  @moduledoc """
-  One supervised process per subscription, holding a watch registration alive across shard
-  restarts.
+  @moduledoc false
 
-  A watcher is not sitting in a call the way a blocked `in/2` caller is, so it has no way to
-  notice that its shard died and nothing to re-register from. This process is that
-  somewhere: it registers the subscription with the shard, monitors the shard so it can
-  register again with the replacement, and monitors the subscriber so the registration goes
-  away when its audience does.
-
-  Events are sent to the subscriber **directly by the shard**, not relayed through here.
-  This process is only the registration's keeper, so a slow subscriber cannot back up behind
-  it and the message path stays one hop.
-  """
+  # NOTE: internal. The prose below is kept as a design record but is not published.
+  #
+  #   One supervised process per subscription, holding a watch registration alive across shard
+  #   restarts.
+  #
+  #   A watcher is not sitting in a call the way a blocked `in/2` caller is, so it has no way to
+  #   notice that its shard died and nothing to re-register from. This process is that
+  #   somewhere: it registers the subscription with the shard, monitors the shard so it can
+  #   register again with the replacement, and monitors the subscriber so the registration goes
+  #   away when its audience does.
+  #
+  #   Events are sent to the subscriber **directly by the shard**, not relayed through here.
+  #   This process is only the registration's keeper, so a slow subscriber cannot back up behind
+  #   it and the message path stays one hop.
 
   use GenServer, restart: :temporary
 

@@ -11,10 +11,33 @@ defmodule Tuplex do
       Tuplex.inp({:job, :_, :_})
       #=> {:ok, {:job, 1, "payload"}}
 
-  A tuple's first element is its **tag**, which must be a concrete atom: it selects the
-  shard the tuple lives in. Templates use `:_` as a wildcard and match exactly otherwise —
-  `1.0` never matches a stored `1`. See `Tuplex.Template` for the full matching rules,
-  including how maps are handled.
+  ## Matching, in brief
+
+  A tuple's first element is its **tag**, and it must be a concrete atom — in stored tuples
+  *and* in templates. The tag selects the shard, so `{:_, :_}` is rejected rather than
+  fanned across every shard; `tags/0` is the explicit way to sweep.
+
+  Everything else about matching is exact:
+
+    * `:_` is the only wildcard, and it matches at any depth.
+    * Comparison is strict equality. `1.0` never matches a stored `1`.
+    * **Arity is part of the match.** `{:job, :_}` never matches `{:job, 1, 2}`.
+    * **Maps match whole, not as subsets.** `{:cfg, %{a: 1}}` does *not* match a stored
+      `{:cfg, %{a: 1, b: 2}}`. A wildcard *inside* a map — `%{a: :_}` — is rejected.
+
+  `Tuplex.Template` has the full rules and the reasoning.
+
+  > #### `:_` cannot be stored and then selected {: .info}
+  >
+  > `:_` is legal in a tuple you write — storage does not interpret content — but no
+  > template can ever name it *specifically*, because `:_` in a template is the wildcard. A
+  > stored `{:flag, :_}` is matched by `{:flag, :_}`, but so is `{:flag, true}`, and there
+  > is no way to ask for only the former.
+  >
+  > It is a known limitation rather than an error: rejecting it correctly would mean walking
+  > every stored term to arbitrary depth on every `out/1`, which is real cost on the hot path
+  > for a value nobody stores deliberately. If you need `:_` as data, encode it — `{:wildcard}`
+  > or `"_"` — and it behaves like any other value.
 
   ## This is not a job queue
 
@@ -77,6 +100,14 @@ defmodule Tuplex do
   alias Tuplex.Shard
   alias Tuplex.Template
   alias Tuplex.Watch
+
+  @typedoc """
+  An opaque handle to a leased tuple, returned by `in/2` and `inp/2` in
+  `{:monitor, :ack}` mode and passed back to `ack/1`.
+
+  Treat it as opaque: its shape is internal and not covered by semantic versioning.
+  """
+  @type lease_handle :: {atom(), reference()}
 
   @default_max_queue 10_000
 
@@ -189,7 +220,7 @@ defmodule Tuplex do
       #=> {:error, :timeout}
   """
   @spec unquote(:in)(Template.template(), keyword()) ::
-          {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | {:error, :timeout}
+          {:ok, Template.t()} | {:ok, Template.t(), lease_handle()} | {:error, :timeout}
   def unquote(:in)(template, opts \\ []) do
     template = Template.validate!(template)
     span(:in, template, timeout!(opts), lease!(opts))
@@ -203,7 +234,22 @@ defmodule Tuplex do
   `:timeout` option as `in/2`, where `0` behaves like `rdp/1`.
 
   **Every** waiting `rd/2` whose template matches an arriving tuple is woken, not just one
-  — a non-destructive read has no reason to be exclusive.
+  — a non-destructive read has no reason to be exclusive. That holds even when a blocked
+  `in/2` consumes the same tuple in the same instant: the reader is still served.
+
+  ## Leased tuples are invisible
+
+  A tuple held under a lease is not visible to readers, so a blocked `rd/2` can sit waiting
+  while a tuple matching its template is sitting in the space, held by someone else. That is
+  deliberate — surfacing an in-flight claim would make `rd` results depend on consumer
+  timing — but it makes the two endings of a lease observably different:
+
+    * the holder **fails**, the tuple is requeued, and the requeue wakes the waiting `rd/2`
+      like any other arrival;
+    * the holder **finishes**, the tuple is consumed, and the waiting `rd/2` never sees it
+      at all.
+
+  So a reader blocked on a leased tuple is woken by failure and not by success.
 
   ## Examples
 
@@ -221,7 +267,7 @@ defmodule Tuplex do
   An alias for `in/2`, for callers who would rather not work around the operator name.
   """
   @spec take(Template.template(), keyword()) ::
-          {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | {:error, :timeout}
+          {:ok, Template.t()} | {:ok, Template.t(), lease_handle()} | {:error, :timeout}
   defdelegate take(template, opts \\ []), to: __MODULE__, as: :in
 
   @doc """
@@ -234,7 +280,13 @@ defmodule Tuplex do
   really is exceptional.
 
   This is the **exact** read: it is serialised through the tag's shard, so a tuple it
-  returns was in the space and is now removed from it. No other consumer can also have it.
+  returns was in the space and is now removed from it. No other consumer can also have it —
+  within this node. That exactness is **shard-local**: it rests on one GenServer per tag
+  serialising its own destructive reads, and it is exactly the guarantee that a distributed
+  version of this library could not offer unchanged. v0.1 is single-node, so the guarantee
+  holds; do not build on it surviving a future that spans nodes.
+
+  Tuples currently held under a lease are invisible here, as they are to every reader.
 
   ## Examples
 
@@ -249,7 +301,7 @@ defmodule Tuplex do
     * `:lease` — as for `in/2`.
   """
   @spec inp(Template.template(), keyword()) ::
-          {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | :empty
+          {:ok, Template.t()} | {:ok, Template.t(), lease_handle()} | :empty
   def inp(template, opts \\ []) do
     template = Template.validate!(template)
     Shard.take(template, lease!(opts))
@@ -262,7 +314,7 @@ defmodule Tuplex do
 
   Unlike `inp/2`, this runs **in the calling process** — a registry lookup and one ETS
   select, with no shard round-trip — so reads are fully parallel and never queue behind
-  pending writes.
+  pending writes. Tuples currently held under a lease are invisible here; see `rd/2`.
 
   The trade is freshness, and it is worth stating plainly rather than papering over: what
   you get back is a snapshot. Another process may take the tuple you just read before you
@@ -296,6 +348,16 @@ defmodule Tuplex do
   Written that way the fan-out is explicit and its cost is visible at the call site, which
   is exactly where it belongs. Note that arity is part of the match too, so a sweep still
   has to pick one — `tags/0` widens the tag, not the shape.
+
+  ## It is a snapshot, and it lags in both directions
+
+  A tag appears here once a shard exists for it, which is on its first `out/1` — not when
+  you first read from it. And a tag whose shard has just died stays listed until the
+  registry processes the exit, so it can be reported for a moment after its tuples are
+  gone, and a shard being started concurrently may not be listed yet.
+
+  Fine for introspection and debugging, which is what it is for. Do not build control flow
+  on it.
   """
   @spec tags() :: [atom()]
   defdelegate tags(), to: Shard
@@ -305,7 +367,8 @@ defmodule Tuplex do
 
   Runs in the calling process, like `rdp/1`, and carries the same caveat: the list is a
   snapshot, and any of it may be taken by somebody else before you act on it. Identical
-  tuples appear once each. Tuples currently held under a lease are not included.
+  tuples appear once each. Tuples currently held under a lease are invisible here; see
+  `rd/2` for what that means for a reader waiting on one.
 
   ## Examples
 
@@ -329,7 +392,7 @@ defmodule Tuplex do
   whether or not the lease is still held, so acknowledging twice, or acknowledging one that
   has already expired, is harmless rather than an error.
   """
-  @spec ack(Shard.handle()) :: :ok
+  @spec ack(lease_handle()) :: :ok
   defdelegate ack(handle), to: Shard
 
   @doc """

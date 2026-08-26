@@ -1,101 +1,111 @@
 defmodule Tuplex.Shard do
-  @moduledoc """
-  One GenServer per tag, owning that tag's table, its sequence counter, and the processes
-  blocked waiting for a tuple that has not arrived yet.
+  @moduledoc false
 
-  Shards are started on demand: the first `out/1` for a tag resolves the tag to a pid and
-  starts a shard if there is none. Resolution goes through `Tuplex.Registry`, whose value
-  carries the shard's **table reference** alongside its pid:
-
-      Registry.register(Tuplex.Registry, tag, table_ref)
-
-  That extra field is what makes the read path cheap, and `tags/0` falls out of the same
-  registry for free rather than being a feature of its own.
-
-  ## Destructive operations are serialised; reads are not
-
-  Serialising through the shard exists to stop two consumers taking the same tuple. That is
-  a property of *destructive* operations only. `read/1` and `read_all/1` mutate nothing and
-  ETS reads are atomic per object, so a GenServer round-trip would buy no correctness while
-  costing a message hop and head-of-line blocking behind every `out` already in the
-  mailbox.
-
-  So non-destructive reads run **in the calling process**: one ETS lookup in the registry
-  for the table reference, then one select. No shard involvement, fully parallel across
-  schedulers. `out/1` and `take/1` always go through the shard.
-
-  This is not a micro-optimisation. The blackboard layer this library is eventually for is
-  `rd`-dominant by nature — many knowledge sources examining the same hypotheses — and a
-  read path that serialised on the tag's shard would bottleneck that layer on day one, on a
-  decision made here.
-
-  ## Two consequences, stated rather than papered over
-
-  **Stale table references.** A caller can hold a reference to a table whose shard has died,
-  in which case `:ets` raises `ArgumentError`. Reads catch it, re-resolve the tag **once**,
-  and retry; a second failure propagates. One retry, not a loop — a shard that cannot stay
-  up should surface as an error, not as an invisible spin.
-
-  Re-resolving can hand back the *same* dead reference, because the registry's cleanup of a
-  dead shard is asynchronous and a read can land inside that window. Retrying there would
-  only raise the same error again, so the shard's liveness decides: a dead shard means the
-  reference cannot be reached from here and an empty space is the honest answer, while a
-  live shard registered against a table it does not have is a bug and is left to raise.
-
-  In practice this path is rare now that `Tuplex.TableKeeper` inherits a dead shard's table.
-  A table survives its shard, keeping the same reference, so a caller holding one across a
-  crash usually keeps reading successfully and the replacement reclaims the very same table.
-  The retry covers what is left: a table genuinely destroyed, which needs the keeper to have
-  gone too.
-
-  **Asymmetric freshness.** `take/1` is serialised and exact: what it returns was in the
-  space and is now yours. `read/1` is lock-free and returns a snapshot that may already be
-  stale by the time the caller sees it — a tuple it found can be taken by someone else
-  immediately after. That is the honest description of a lock-free read.
-
-  ## Waiters
-
-  `wait/3` blocks until a matching tuple arrives. The blocking happens **in the calling
-  process**, never inside the shard: registering a waiter is a fast call that either
-  satisfies the read from the table or files the caller in the waiter index and returns, at
-  which point the caller sits in its own `receive`. A shard that blocked on behalf of a
-  caller would stop serving every other process using that tag.
-
-  Waiters are filed by `Tuplex.Template.key/1`, so a newly written tuple is only offered to
-  waiters under its own key. The key **narrows the candidate set; it does not decide the
-  match** — two waiters can share a key and hold different templates, so `matches?/2` is
-  still evaluated per waiter within the bucket.
-
-  ### Readers are served before the taker
-
-  When a tuple arrives, **every** matching `rd` waiter is woken first, and only then is the
-  tuple handed to exactly one `in` waiter, which consumes it.
-
-  The order is not cosmetic. Satisfying the `in` first would delete the tuple while `rd`
-  waiters that legitimately matched it were still blocked — and they would go on blocking,
-  waiting for a tuple that has already been and gone. A silent hang, which is the failure
-  mode this codebase works hardest to avoid.
-
-  For the same reason the tuple is **inserted before any waiter is served**, even when a
-  waiter takes it in the same breath: insert, serve the readers, then delete on behalf of
-  the taker. Writing it the other way would leave a window in which a concurrent
-  caller-side read sees a gap where the tuple never existed, and would put a hole in the
-  sequence accounting.
-
-  ### Waiters are served in arrival order
-
-  Linda leaves the choice among waiters unspecified, and prepending to a list would make
-  service LIFO by accident. That would contradict the FIFO the store already guarantees for
-  tuples, so buckets are stored newest-first — prepending is O(1) — and reversed when
-  served. Predictable beats nondeterministic when it is free.
-
-  ### Blocked callers are monitored
-
-  A caller that dies, or that times out and walks away, would otherwise leave a waiter that
-  matches forever and silently swallows a tuple meant for a live consumer. Every waiter is
-  monitored on registration, dropped on `:DOWN`, and demonitored when served or cancelled.
-  It is a leak that only shows up under load.
-  """
+  # NOTE: internal. The prose below is kept as a design record but is not published.
+  #
+  #   One GenServer per tag, owning that tag's table, its sequence counter, and the processes
+  #   blocked waiting for a tuple that has not arrived yet.
+  #
+  #   Shards are started on demand: the first `out/1` for a tag resolves the tag to a pid and
+  #   starts a shard if there is none. Resolution goes through `Tuplex.Registry`, whose value
+  #   carries the shard's **table reference** alongside its pid:
+  #
+  #       Registry.register(Tuplex.Registry, tag, table_ref)
+  #
+  #   That extra field is what makes the read path cheap, and `tags/0` falls out of the same
+  #   registry for free rather than being a feature of its own.
+  #
+  #   ## Destructive operations are serialised; reads are not
+  #
+  #   Serialising through the shard exists to stop two consumers taking the same tuple. That is
+  #   a property of *destructive* operations only. `read/1` and `read_all/1` mutate nothing and
+  #   ETS reads are atomic per object, so a GenServer round-trip would buy no correctness while
+  #   costing a message hop and head-of-line blocking behind every `out` already in the
+  #   mailbox.
+  #
+  #   So non-destructive reads run **in the calling process**: one ETS lookup in the registry
+  #   for the table reference, then one select. No shard involvement, fully parallel across
+  #   schedulers. `out/1` and `take/1` always go through the shard.
+  #
+  #   This is not a micro-optimisation. The blackboard layer this library is eventually for is
+  #   `rd`-dominant by nature — many knowledge sources examining the same hypotheses — and a
+  #   read path that serialised on the tag's shard would bottleneck that layer on day one, on a
+  #   decision made here.
+  #
+  #   ## Two consequences, stated rather than papered over
+  #
+  #   **Stale table references.** A caller can hold a reference to a table whose shard has died,
+  #   in which case `:ets` raises `ArgumentError`. Reads catch it, re-resolve the tag **once**,
+  #   and retry; a second failure propagates. One retry, not a loop — a shard that cannot stay
+  #   up should surface as an error, not as an invisible spin.
+  #
+  #   Re-resolving can hand back the *same* dead reference, because the registry's cleanup of a
+  #   dead shard is asynchronous and a read can land inside that window. Retrying there would
+  #   only raise the same error again, so the shard's liveness decides: a dead shard means the
+  #   reference cannot be reached from here and an empty space is the honest answer, while a
+  #   live shard registered against a table it does not have is a bug and is left to raise.
+  #
+  #   In practice this path is rare now that `Tuplex.TableKeeper` inherits a dead shard's table.
+  #   A table survives its shard, keeping the same reference, so a caller holding one across a
+  #   crash usually keeps reading successfully and the replacement reclaims the very same table.
+  #   The retry covers what is left: a table genuinely destroyed, which needs the keeper to have
+  #   gone too.
+  #
+  #   **Asymmetric freshness.** `take/1` is serialised and exact: what it returns was in the
+  #   space and is now yours. `read/1` is lock-free and returns a snapshot that may already be
+  #   stale by the time the caller sees it — a tuple it found can be taken by someone else
+  #   immediately after. That is the honest description of a lock-free read.
+  #
+  #   ## Waiters
+  #
+  #   `wait/3` blocks until a matching tuple arrives. The blocking happens **in the calling
+  #   process**, never inside the shard: registering a waiter is a fast call that either
+  #   satisfies the read from the table or files the caller in the waiter index and returns, at
+  #   which point the caller sits in its own `receive`. A shard that blocked on behalf of a
+  #   caller would stop serving every other process using that tag.
+  #
+  #   Waiters are filed by `Tuplex.Template.key/1`, so a newly written tuple is only offered to
+  #   waiters under its own key. The key **narrows the candidate set; it does not decide the
+  #   match** — two waiters can share a key and hold different templates, so `matches?/2` is
+  #   still evaluated per waiter within the bucket.
+  #
+  #   ### Every matching reader is served, taker or no taker
+  #
+  #   This is the guarantee, and it is observable: when a tuple arrives, **every** matching `rd`
+  #   waiter is woken and exactly one `in` waiter consumes it — including when both match the
+  #   same tuple in the same instant. A reader is never left blocked on a tuple that a taker
+  #   removed out from under it.
+  #
+  #   The tuple is also **inserted before any waiter is served**, even when a waiter takes it in
+  #   the same breath. Writing it the other way would leave a window in which a concurrent
+  #   caller-side read sees a gap where the tuple never existed, and would put a hole in the
+  #   sequence accounting.
+  #
+  #   > #### Implementation note, not a guarantee {: .info}
+  #   >
+  #   > `serve/4` delivers to readers before the taker. That ordering is **currently
+  #   > unobservable**: `deliver/4` sends the tuple term already in hand, and both lists are
+  #   > computed before any delivery, so deleting the row cannot affect what a reader receives.
+  #   > Reversing the order changes no behaviour and no test catches it — verified by mutation,
+  #   > see `test/MUTATION_LOG.md`.
+  #   >
+  #   > It is kept because it costs nothing and would become load-bearing the moment delivery
+  #   > re-read the store instead of using the captured term. Do not rely on it; rely on the
+  #   > guarantee above, which is tested.
+  #
+  #   ### Waiters are served in arrival order
+  #
+  #   Linda leaves the choice among waiters unspecified, and prepending to a list would make
+  #   service LIFO by accident. That would contradict the FIFO the store already guarantees for
+  #   tuples, so buckets are stored newest-first — prepending is O(1) — and reversed when
+  #   served. Predictable beats nondeterministic when it is free.
+  #
+  #   ### Blocked callers are monitored
+  #
+  #   A caller that dies, or that times out and walks away, would otherwise leave a waiter that
+  #   matches forever and silently swallows a tuple meant for a live consumer. Every waiter is
+  #   monitored on registration, dropped on `:DOWN`, and demonitored when served or cancelled.
+  #   It is a leak that only shows up under load.
 
   use GenServer
 
@@ -149,7 +159,7 @@ defmodule Tuplex.Shard do
   @type event :: :out | :in | :requeue
 
   @typedoc "An opaque handle to a held tuple, for `ack/1`."
-  @opaque handle :: {tag(), reference()}
+  @type handle :: {tag(), reference()}
 
   @doc """
   Releases a held tuple: the work it represents is finished.
@@ -312,6 +322,24 @@ defmodule Tuplex.Shard do
         end
     end
   end
+
+  @doc """
+  Whether a `GenServer.call/3` exit reason means the message provably never arrived.
+
+  `:noproc` is the only one. It says the call never reached a process, which makes it the
+  only reason a retry can be safe. Every other reason — including a shard that died *while*
+  handling the call — leaves open the possibility that the work was done before the process
+  went, and retrying that would write a tuple twice.
+
+  A shard that dies after handling an `out` surfaces to its caller as an exit carrying the
+  death reason rather than `:noproc`, so it correctly propagates instead of being retried.
+
+  Exposed so the decision can be tested directly. The double-write window it guards is
+  itself untested; see `test/MUTATION_LOG.md`.
+  """
+  @spec retryable_exit?(term()) :: boolean()
+  def retryable_exit?({:noproc, _details}), do: true
+  def retryable_exit?(_reason), do: false
 
   @doc false
   # The stale-reference retry, exposed so it can be tested with a deliberately dead table.
@@ -714,12 +742,13 @@ defmodule Tuplex.Shard do
           |> Enum.filter(&Template.matches?(&1.template, tuple))
           |> Enum.split_with(&(&1.mode == :rd))
 
-        # Every matching reader is woken first...
+        # Readers first, then the taker. Defensive rather than load-bearing: deliver/4 sends
+        # the tuple term already in hand and both lists are computed above, so the row being
+        # deleted cannot affect what a reader receives, and reversing this changes nothing
+        # observable. Kept because it costs nothing and would matter the moment delivery
+        # re-read the store. See test/MUTATION_LOG.md.
         state = Enum.reduce(readers, state, &deliver(&2, &1, tuple, nil))
 
-        # ...and only then does one taker consume the tuple. The other order would delete it
-        # out from under readers that legitimately matched, leaving them blocked forever on
-        # a tuple that has already come and gone.
         case takers do
           [taker | _rest] ->
             {state, handle} = consume(state, taker, seq, tuple)
@@ -904,10 +933,6 @@ defmodule Tuplex.Shard do
   # A shard can die between being resolved and being called, and the registry's cleanup is
   # asynchronous, so for a moment the tag still names the corpse. Now that the table outlives
   # the shard, the right answer is to wait for the replacement rather than to fail.
-  #
-  # Only a `:noproc` exit is retried. It is the one reason that proves the message was never
-  # delivered; any other exit could mean the call was handled and the shard died afterwards,
-  # and retrying that would write a tuple twice.
   defp call_shard(tag, message) do
     call_shard(tag, message, System.monotonic_time(:millisecond) + @resolve_timeout)
   end
@@ -917,7 +942,10 @@ defmodule Tuplex.Shard do
       try do
         GenServer.call(pid, message)
       catch
-        :exit, {:noproc, _details} -> again(tag, message, deadline, &call_shard/3)
+        :exit, reason ->
+          if retryable_exit?(reason),
+            do: again(tag, message, deadline, &call_shard/3),
+            else: exit(reason)
       end
     end
   end
@@ -934,8 +962,10 @@ defmodule Tuplex.Shard do
         try do
           GenServer.call(pid, message)
         catch
-          :exit, {:noproc, _details} ->
-            again(tag, message, deadline, &call_existing(&1, &2, default, &3))
+          :exit, reason ->
+            if retryable_exit?(reason),
+              do: again(tag, message, deadline, &call_existing(&1, &2, default, &3)),
+              else: exit(reason)
         end
 
       :error ->

@@ -1,5 +1,11 @@
 defmodule Tuplex.Template do
   @moduledoc """
+  > #### Internal {: .warning}
+  >
+  > Published because the matching rules below are the exact semantics of every template in
+  > the library, and there is nowhere better to state them. It is **not part of the public
+  > API and not covered by semantic versioning**. Use `Tuplex`.
+
   Validation, shard-key extraction, and match-spec compilation for tuples and templates.
 
   This module is pure. It performs no side effects, owns no state, and never touches
@@ -221,7 +227,7 @@ defmodule Tuplex.Template do
   @doc """
   Returns the waiter-index key for a tuple or template: its tag paired with its arity.
 
-  A tuple and every template that can match it share this key. `Tuplex.Shard` relies on
+  A tuple and every template that can match it share this key. The shard relies on
   that: a newly written tuple only has to be offered to waiters filed under its own key,
   and if the two ever disagreed a legitimately waiting `in` would never wake.
 

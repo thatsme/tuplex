@@ -13,6 +13,11 @@ Tuplex.out({:job, 17, "resize thumbnails"})
 {:ok, {:job, id, task}} = Tuplex.in({:job, :_, :_})
 ```
 
+**This is not a job queue.** If you already know *who* does the work and *when*, reach for
+Oban, Broadway, Phoenix.PubSub or a plain GenServer instead — [there's a table
+below](#when-not-to-use-this). Tuplex is for coordination that is genuinely anonymous, and
+used as a general-purpose queue it is a worse queue.
+
 ## The idea in one paragraph
 
 `receive` is already a guarded command over your mailbox: you write patterns, and the

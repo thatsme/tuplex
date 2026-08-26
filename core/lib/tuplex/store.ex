@@ -1,9 +1,16 @@
 defmodule Tuplex.Store do
   @moduledoc """
+  > #### Internal {: .warning}
+  >
+  > Published because its semantics are load-bearing for anyone reasoning about the space —
+  > the storage form is where the sharp edges are. It is **not part of the public API and
+  > not covered by semantic versioning**: the record layout will change when ephemeral
+  > tuples land, and no version bump will be considered breaking for it. Use `Tuplex`.
+
   The tuple table for one shard, and the only module in Tuplex that calls `:ets`.
 
   `Store` is process-free. It holds no state beyond the table it is handed, spawns nothing,
-  and makes no decision about *when* to read or write — that is `Tuplex.Shard`'s job. What
+  and makes no decision about *when* to read or write — that is the shard's job. What
   it owns is the storage form, which is where the sharp edges are.
 
   ## Storage form
@@ -76,7 +83,7 @@ defmodule Tuplex.Store do
   taking the same tuple, which is a property of *destructive* operations only. `read/2` and
   `read_all/2` mutate nothing and ETS reads are atomic per object, so routing them through
   a GenServer would buy no correctness while costing a message round-trip and head-of-line
-  blocking behind every queued `out`. `Tuplex.Shard` therefore runs them in the calling
+  blocking behind every queued `out`. The shard therefore runs them in the calling
   process; `take/2` and `insert/3` it keeps to itself.
 
   `take/2` reads a row and then deletes it in two steps, which is atomic only because the
@@ -101,7 +108,7 @@ defmodule Tuplex.Store do
   ## Options
 
     * `:heir` — `{pid, data}` to hand the table to if the owner dies, which is how
-      `Tuplex.TableKeeper` keeps a shard's tuples alive across a crash.
+      the table keeper keeps a shard's tuples alive across a crash.
   """
   @spec new(atom(), keyword()) :: tab()
   def new(name \\ :tuplex_store, opts \\ []) when is_atom(name) do
@@ -118,7 +125,7 @@ defmodule Tuplex.Store do
   Returns the sequence number a shard should write next.
 
   Derived from the table rather than started at zero. At v0.1 a crashed shard loses its
-  table and zero would do, but once `Tuplex.TableKeeper` hands a reclaimed table back the
+  table and zero would do, but once the table keeper hands a reclaimed table back the
   rows in it are already numbered — a counter restarting at zero would collide on the first
   insert and trip `insert/3`'s raise. That is the right failure, but a needless one, and
   deriving the counter here makes the handover a no-op.
