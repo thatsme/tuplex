@@ -11,3 +11,8 @@ desktop.ini
 
 # Local environment overrides
 .env
+
+# Generated docs and built packages
+/core/doc/
+/blackboard/doc/
+*.tar

@@ -9,7 +9,7 @@ defmodule Tuplex.Template do
 
   ## Tuples and templates
 
-  A **tuple** is what you write with `Tuplex.out/2`. A **template** is what you match with
+  A **tuple** is what you write with `Tuplex.out/1`. A **template** is what you match with
   (`in`, `rd`, `inp`, `rdp`, `rd_all`, `watch`). Both are Erlang tuples whose first element
   is an atom **tag**:
 
@@ -63,14 +63,14 @@ defmodule Tuplex.Template do
 
     * **Wildcards inside maps**, as above.
 
-  None of these apply to tuples passed to `out/2`. Stored tuples are data: they are never
+  None of these apply to tuples passed to `out/1`. Stored tuples are data: they are never
   interpreted as patterns, so they may contain `:_`, `:"$1"`, and maps freely. Only the tag
   rule is shared, because storage still has to route them.
   """
 
   @wildcard :_
 
-  @typedoc "A tuple written into the space with `Tuplex.out/2`."
+  @typedoc "A tuple written into the space with `Tuplex.out/1`."
   @type t :: tuple()
 
   @typedoc "A pattern matched against stored tuples. `:_` is the wildcard."

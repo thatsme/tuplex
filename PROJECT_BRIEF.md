@@ -576,6 +576,25 @@ Two consequences worth keeping in mind:
   threaded through to stop it emitting `[:tuplex, :inp]` as well as its own span. Double
   counting an operation is how a dashboard starts lying.
 
+### The stateful model, and what it is scoped to
+
+`statem_test.exs` models the **deterministic serial subset** — `out`, `inp`, `rdp`,
+`rd_all`, `tags` — as a map of tag to an ordered list of tuples. That is enough to make
+every postcondition **exact rather than a range**, including *which* tuple comes back: FIFO
+means `inp` returns the oldest match and no other, which is a stronger claim than "some
+matching tuple" and pins the ordering guarantee that fell out of `:ordered_set` in step 1.
+
+Blocking `in`/`rd`, leases, kills and watches are deliberately outside the model. Blocking
+operations do not return, so making them commands would contort the model into something no
+longer trustworthy, and a subtly wrong model produces false failures that cost a day each.
+Those claims are defended by the hand-written properties, which can orchestrate processes in
+ways a statem model cannot express.
+
+What the model buys over those is not coverage but **shrinking**. Verified by mutation: with
+the model altered to expect the *newest* match, the failure came back as a three-command
+minimum — `out({:a, 2})`, `out({:a, 1})`, `inp` — rather than the forty-command sequence
+that produced it.
+
 ### The key invariant
 
 ```
@@ -598,8 +617,8 @@ the project; there is no partial credit for a half-finished layer.
 4. Leases + `Tuplex.TableKeeper` — **done**
 5. `watch`, `eval`, `rd_all` — **done**
 6. **Telemetry**, as one pass over the complete surface — **done**
-7. Property tests (PropEr, stateful)
-8. README and docs
+7. Property tests (PropEr, stateful) — **done**
+8. README and docs — **done**
 
 Telemetry gets its own step rather than being folded into each operation as it is built.
 It is cross-cutting: adding it per-op means revising event names and measurement shapes

@@ -20,15 +20,15 @@ defmodule Tuplex do
 
   If the caller already knows *who* does the work and *when*, Tuplex is the wrong tool:
 
-  | If you need                       | Use              |
-  | --------------------------------- | ---------------- |
-  | Durable, retried background jobs  | Oban             |
-  | Backpressured data pipelines      | Broadway         |
-  | Topic fan-out to known subscribers| Phoenix.PubSub   |
-  | Named process lookup              | Registry         |
+  | If you need | Use | Why not Tuplex |
+  | --- | --- | --- |
+  | Durable, retried background jobs | Oban | Tuplex is in memory; a restart is an empty space |
+  | Backpressured data pipelines | Broadway | Consumers pull when free; no demand flows upstream |
+  | Topic fan-out to known subscribers | Phoenix.PubSub | Known subscribers each getting a copy is a broadcast |
+  | To call one process and get an answer | GenServer | A request addressed to one server is not anonymous |
 
   Tuplex earns its place only where the coordination is genuinely anonymous and
-  shape-driven.
+  shape-driven. Used as a general-purpose queue it is a worse queue.
 
   ## Observability
 
@@ -37,21 +37,41 @@ defmodule Tuplex do
   producers are behind. See `Tuplex.Telemetry`, and read its note on `tag` cardinality
   before mapping any of it onto metric labels.
 
-  ## Importing
+  ## Calling `in/2`
 
-  `in/2` keeps its Linda name, which collides with `Kernel.in/2`. Alias rather than import,
-  or import with the clash excluded:
+  Call it qualified — `Tuplex.in(template)` — which is what the examples here do and what
+  the README recommends.
 
-      import Tuplex, except: [in: 2]
+  The name collides with `Kernel.in/2`, the `x in list` operator, which is a macro and is
+  auto-imported into every module. So `import Tuplex` fails: two `in/2`s are in scope and
+  neither wins. `take/2` is an alias for `in/2` for anyone whose linter or editor objects to
+  the qualified form.
 
-  `take/2` is an alias for `in/2` if you would rather not deal with the name at all.
+  It *is* possible to import it, by un-importing the Kernel macro first, but it is a poor
+  trade — four characters saved against `x in list` breaking everywhere else in the module,
+  which is a confusing failure to debug:
 
-  > #### Work in progress {: .warning}
-  >
-  > v0.1 is feature-complete: `out/1`, `in/2`, `rd/2`, `inp/2`, `rdp/1`, `rd_all/1`,
-  > `take/2`, `eval/1`, `watch/2`, `unwatch/1`, `ack/1`, `tags/0`, leases, and telemetry
-  > (see `Tuplex.Telemetry`). Still to come before release: the stateful property suite and
-  > the README.
+      # not recommended
+      import Kernel, except: [in: 2]
+      import Tuplex
+
+  ## Further reading
+
+  Linda is Gelernter's, and the vocabulary here is deliberately his:
+
+    * Gelernter, D. (1985). *Generative Communication in Linda.* ACM Transactions on
+      Programming Languages and Systems 7(1), 80–112. The original: `out`, `in`, `rd`,
+      `eval`, and the argument for decoupling in time, space and reference.
+    * Carriero, N. and Gelernter, D. (1989). *Linda in Context.* Communications of the ACM
+      32(4), 444–458. Answers the objections, and is the clearest statement of when a tuple
+      space is and is not the right shape.
+    * Hayes-Roth, B. (1985). *A Blackboard Architecture for Control.* Artificial
+      Intelligence 26(3), 251–321. Where the `rd`-dominant workload that shaped this
+      library's read path comes from.
+
+  Tuplex departs from the papers in one respect that matters: leases. Classical Linda has no
+  answer for a consumer that takes a tuple and then dies, and `in/2`'s `:lease` option is
+  that answer.
   """
 
   alias Tuplex.Shard
@@ -155,8 +175,9 @@ defmodule Tuplex do
   ## The name
 
   `in` is a binary operator in Elixir, so this is defined as `def unquote(:in)`. That is
-  invisible at the call site but it does mean `import Tuplex` clashes with `Kernel.in/2` —
-  alias the module, import with `except: [in: 2]`, or use `take/2`.
+  invisible at the call site, but it does mean `import Tuplex` fails: `Kernel.in/2` is a
+  macro auto-imported everywhere, and two `in/2`s cannot both be in scope. Call it qualified,
+  or use `take/2`. See the module docs.
 
   ## Examples
 
@@ -239,13 +260,13 @@ defmodule Tuplex do
 
   Returns `{:ok, tuple}`, or `:empty` if nothing matches right now.
 
-  Unlike `inp/1`, this runs **in the calling process** — a registry lookup and one ETS
+  Unlike `inp/2`, this runs **in the calling process** — a registry lookup and one ETS
   select, with no shard round-trip — so reads are fully parallel and never queue behind
   pending writes.
 
   The trade is freshness, and it is worth stating plainly rather than papering over: what
   you get back is a snapshot. Another process may take the tuple you just read before you
-  do anything with it. If you need the tuple to be *yours*, use `inp/1`.
+  do anything with it. If you need the tuple to be *yours*, use `inp/2`.
 
   ## Examples
 
@@ -392,7 +413,7 @@ defmodule Tuplex do
   > for a consumer to match against.
   >
   > A failure emits `[:tuplex, :eval, :exception]` telemetry and crashes its own process,
-  > which is visible in logs and metrics but not in the space. So `eval/2` is for computing
+  > which is visible in logs and metrics but not in the space. So `eval/1` is for computing
   > a **tuple's contents**, not for work whose completion matters. If a consumer needs to
   > know the work happened, have it wait on the tuple with `in/2` and give the producer a
   > lease.

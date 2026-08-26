@@ -34,7 +34,8 @@ defmodule Tuplex.MixProject do
     [
       {:telemetry, "~> 1.2"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:stream_data, "~> 1.1", only: [:dev, :test]}
+      {:stream_data, "~> 1.1", only: [:dev, :test]},
+      {:propcheck, "~> 1.4", only: [:dev, :test]}
     ]
   end
 

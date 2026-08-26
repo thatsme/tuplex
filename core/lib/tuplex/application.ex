@@ -32,7 +32,7 @@ defmodule Tuplex.Application do
       {DynamicSupervisor,
        name: Tuplex.WatchSupervisor, strategy: :one_for_one, max_restarts: 100, max_seconds: 5},
 
-      # eval/2's processes, supervised so a computation that crashes is reported rather than
+      # eval/1's processes, supervised so a computation that crashes is reported rather than
       # silently orphaned.
       {Task.Supervisor, name: Tuplex.EvalSupervisor}
     ]

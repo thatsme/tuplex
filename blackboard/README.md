@@ -1,21 +1,9 @@
 # TuplexBlackboard
 
-**TODO: Add description**
+**Not yet implemented.**
 
-## Installation
+This project reserves the name for the blackboard layer that will sit on top of
+[Tuplex](https://hex.pm/packages/tuplex) — knowledge sources examining and refining shared
+hypotheses, rather than the bare coordination primitives `tuplex` provides.
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `tuplex_blackboard` to your list of dependencies in `mix.exs`:
-
-```elixir
-def deps do
-  [
-    {:tuplex_blackboard, "~> 0.1.0"}
-  ]
-end
-```
-
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/tuplex_blackboard>.
-
+It ships no code and is not published to hex. Use `tuplex` directly.
