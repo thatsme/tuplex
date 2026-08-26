@@ -101,6 +101,7 @@ defmodule Tuplex.Shard do
 
   alias Tuplex.Store
   alias Tuplex.TableKeeper
+  alias Tuplex.Telemetry
   alias Tuplex.Template
 
   @registry Tuplex.Registry
@@ -119,6 +120,10 @@ defmodule Tuplex.Shard do
     watches: %{},
     watch_index: %{},
     leases: %{},
+    # Maintained rather than counted: waiter_count rides on every shard-side event, and
+    # flattening the buckets per event would make an O(1) measurement O(waiters).
+    waiting: 0,
+    watching: 0,
     # mref => {:waiter | :watch | :lease, ref}. One map for every monitor the shard holds,
     # tagged by what it is watching, so a :DOWN needs one lookup rather than three misses.
     monitors: %{}
@@ -209,11 +214,11 @@ defmodule Tuplex.Shard do
   Returns `:empty` when nothing matches, and does not start a shard: a tag with no shard
   has nothing to take.
   """
-  @spec take(Template.template(), lease()) ::
+  @spec take(Template.template(), lease(), :inp | :in) ::
           {:ok, Template.t()} | {:ok, Template.t(), handle()} | :empty
-  def take(template, lease \\ false) do
+  def take(template, lease \\ false, op \\ :inp) do
     {tag, _arity} = Template.key(template)
-    call_existing(tag, {:take, template, lease}, :empty)
+    call_existing(tag, {:take, template, lease, op}, :empty)
   end
 
   @doc """
@@ -255,6 +260,23 @@ defmodule Tuplex.Shard do
           {:ok, Template.t()} | {:error, :timeout}
   def wait(mode, template, timeout, lease? \\ false) do
     wait_until(mode, template, deadline(timeout), lease?)
+  end
+
+  @doc """
+  Returns the number of rows in a tag's table, or `0` if it has no shard.
+
+  `:ets.info/2` is O(1) and readable from any process, which is what lets a caller-side
+  event carry it without asking the shard for anything.
+  """
+  @spec space_size(tag()) :: non_neg_integer()
+  def space_size(tag) do
+    case lookup(tag) do
+      {:ok, _pid, tab} -> Store.size(tab)
+      :error -> 0
+    end
+  rescue
+    # The table went with its shard between the lookup and the read.
+    ArgumentError -> 0
   end
 
   @doc """
@@ -391,7 +413,7 @@ defmodule Tuplex.Shard do
     # interrupted requeue can add a row.
     state = reclaim_leases(%__MODULE__{tag: tag, tab: tab, seq: 1}, Store.recover(tab))
 
-    {:ok, %{state | seq: Store.next_seq(tab)}}
+    {:ok, schedule_stats(%{state | seq: Store.next_seq(tab)})}
   end
 
   defp acquire(tag) do
@@ -423,14 +445,29 @@ defmodule Tuplex.Shard do
     :ok = Store.insert(state.tab, seq, tuple)
     state = serve(%{state | seq: seq + 1}, tuple, seq, :out)
 
+    emit(state, [:tuplex, :out], %{}, %{arity: tuple_size(tuple)})
+
     {:reply, {:ok, seq}, state}
   end
 
-  def handle_call({:take, template, lease}, {pid, _tag}, state) do
-    case satisfy(state, :in, template, lease, pid) do
-      {:ok, tuple, handle, state} -> {:reply, reply(lease, tuple, handle), state}
-      :empty -> {:reply, :empty, state}
+  def handle_call({:take, template, lease, op}, {pid, _tag}, state) do
+    {reply, result, state} =
+      case satisfy(state, :in, template, lease, pid) do
+        {:ok, tuple, handle, state} -> {reply(lease, tuple, handle), :ok, state}
+        :empty -> {:empty, :empty, state}
+      end
+
+    # in/2 with a zero timeout comes through here too, but it is already inside its own
+    # span; emitting again would double-count the same operation.
+    if op == :inp do
+      emit(state, [:tuplex, :inp], %{}, %{
+        arity: tuple_size(template),
+        result: result,
+        lease: lease
+      })
     end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:wait, mode, template, ref, lease}, {pid, _tag}, state) do
@@ -477,7 +514,62 @@ defmodule Tuplex.Shard do
   # already moved when give_away/3 was called.
   def handle_info({:"ETS-TRANSFER", _tab, _from, _data}, state), do: {:noreply, state}
 
+  def handle_info(:stats, state) do
+    now = System.monotonic_time(:millisecond)
+
+    :telemetry.execute(
+      [:tuplex, :shard, :stats],
+      %{
+        space_size: Store.size(state.tab),
+        waiter_count: state.waiting,
+        watch_count: state.watching,
+        lease_count: map_size(state.leases),
+        oldest_waiter_age_ms: oldest_waiter_age(state, now)
+      },
+      %{tag: state.tag}
+    )
+
+    {:noreply, schedule_stats(state)}
+  end
+
   def handle_info(_message, state), do: {:noreply, state}
+
+  # The measurement that pages someone: a shard whose oldest waiter keeps ageing is starved,
+  # and no per-operation event can say so, because nothing is happening.
+  defp oldest_waiter_age(state, now) do
+    state.waiters
+    |> Map.values()
+    |> Enum.reduce(nil, fn bucket, oldest ->
+      Enum.reduce(bucket, oldest, fn waiter, acc ->
+        if acc == nil or waiter.at < acc, do: waiter.at, else: acc
+      end)
+    end)
+    |> case do
+      nil -> 0
+      at -> now - at
+    end
+  end
+
+  defp schedule_stats(state) do
+    case Telemetry.stats_interval() do
+      :off -> state
+      interval when is_integer(interval) -> Process.send_after(self(), :stats, interval)
+    end
+
+    state
+  end
+
+  # Shard-side events can afford space_size and waiter_count: both are O(1) from here.
+  defp emit(state, event, measurements, metadata) do
+    :telemetry.execute(
+      event,
+      Map.merge(
+        %{count: 1, space_size: Store.size(state.tab), waiter_count: state.waiting},
+        measurements
+      ),
+      Map.put(metadata, :tag, state.tag)
+    )
+  end
 
   # -- leases -----------------------------------------------------------------
 
@@ -486,7 +578,7 @@ defmodule Tuplex.Shard do
   defp acknowledge(state, ref) do
     case Map.get(state.leases, ref) do
       nil -> state
-      {seq, _mref, _mode} -> state |> release(seq, ref) |> drop_lease(ref)
+      {seq, _mref, mode} -> state |> drop_lease(ref) |> release(seq, ref, mode, :ack)
     end
   end
 
@@ -505,9 +597,9 @@ defmodule Tuplex.Shard do
         state = drop_lease(state, ref)
 
         if discards?(mode, reason) do
-          release(state, seq, ref)
+          release(state, seq, ref, mode, reason)
         else
-          requeue(state, seq, ref)
+          requeue(state, seq, ref, mode, reason)
         end
     end
   end
@@ -515,19 +607,38 @@ defmodule Tuplex.Shard do
   defp discards?(:monitor, :normal), do: true
   defp discards?(_mode, _reason), do: false
 
-  defp release(state, seq, ref) do
-    :ok = Store.release(state.tab, seq, ref)
-    state
+  defp release(state, seq, ref, mode, reason) do
+    case Store.release(state.tab, seq, ref) do
+      {:ok, tuple} ->
+        emit(state, [:tuplex, :lease, :released], %{}, %{
+          arity: tuple_size(tuple),
+          mode: mode,
+          reason: reason
+        })
+
+        state
+
+      :error ->
+        state
+    end
   end
 
-  defp requeue(state, seq, ref) do
+  defp requeue(state, seq, ref, mode, reason) do
     new_seq = state.seq
 
     case Store.requeue(state.tab, seq, ref, new_seq) do
       {:ok, tuple} ->
         # A requeued tuple is a fresh arrival as far as waiters are concerned — somebody may
         # already be blocked on it.
-        serve(%{state | seq: new_seq + 1}, tuple, new_seq, :requeue)
+        state = serve(%{state | seq: new_seq + 1}, tuple, new_seq, :requeue)
+
+        emit(state, [:tuplex, :lease, :requeued], %{}, %{
+          arity: tuple_size(tuple),
+          mode: mode,
+          reason: reason
+        })
+
+        state
 
       :error ->
         state
@@ -709,7 +820,8 @@ defmodule Tuplex.Shard do
       state
       | watches: Map.update(state.watches, key, [watcher], &[watcher | &1]),
         watch_index: Map.put(state.watch_index, ref, {key, mref}),
-        monitors: Map.put(state.monitors, mref, {:watch, ref})
+        monitors: Map.put(state.monitors, mref, {:watch, ref}),
+        watching: state.watching + 1
     }
   end
 
@@ -725,7 +837,8 @@ defmodule Tuplex.Shard do
           state
           | watches: drop_from_bucket(state.watches, key, ref),
             watch_index: index,
-            monitors: Map.delete(state.monitors, mref)
+            monitors: Map.delete(state.monitors, mref),
+            watching: state.watching - 1
         }
     end
   end
@@ -735,7 +848,15 @@ defmodule Tuplex.Shard do
   defp register(state, mode, template, ref, pid, lease) do
     key = Template.key(template)
     mref = Process.monitor(pid)
-    waiter = %{ref: ref, pid: pid, mode: mode, template: template, lease: lease}
+
+    waiter = %{
+      ref: ref,
+      pid: pid,
+      mode: mode,
+      template: template,
+      lease: lease,
+      at: System.monotonic_time(:millisecond)
+    }
 
     %{
       state
@@ -743,7 +864,8 @@ defmodule Tuplex.Shard do
         # offered in arrival order rather than in whatever order the cons cell produced.
         waiters: Map.update(state.waiters, key, [waiter], &[waiter | &1]),
         waiter_index: Map.put(state.waiter_index, ref, {key, mref}),
-        monitors: Map.put(state.monitors, mref, {:waiter, ref})
+        monitors: Map.put(state.monitors, mref, {:waiter, ref}),
+        waiting: state.waiting + 1
     }
   end
 
@@ -759,7 +881,8 @@ defmodule Tuplex.Shard do
           state
           | waiters: drop_from_bucket(state.waiters, key, ref),
             waiter_index: index,
-            monitors: Map.delete(state.monitors, mref)
+            monitors: Map.delete(state.monitors, mref),
+            waiting: state.waiting - 1
         }
     end
   end

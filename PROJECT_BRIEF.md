@@ -532,6 +532,50 @@ computing a **tuple's contents**, not for work whose completion matters — whic
 was in Linda too. A consumer that needs to know the work happened should wait on the tuple
 and the producer should hold a lease.
 
+### Telemetry
+
+Four decisions shape the event vocabulary. `Tuplex.Telemetry` is the reference; this is why.
+
+**Spans only where duration is interesting.** `in` and `rd` are spans; nothing else is.
+Their duration is **how long a consumer waited**, which answers "are my consumers starved or
+are my producers behind" — the one operational question nothing else in the system exposes.
+`out` is an ETS insert and a waiter scan, and a span on it would double hot-path event
+volume to produce a number nobody can act on. Everything else is one discrete event at its
+funnel point, which is what the funnel-point discipline from step 3 was for.
+
+**Cardinality.** `tag` goes in metadata, because a telemetry consumer should decide what to
+do with it — but tags are user-defined atoms and someone will map metadata straight onto
+Prometheus labels. The `Tuplex.Telemetry` moduledoc says explicitly that **`tag` is unbounded
+and must not be a metric label unless the tag set is fixed and small.** It cannot be
+enforced; an unread warning still beats a silent footgun, and whoever hits it will search for
+exactly that paragraph. `arity` is bounded and stays.
+
+**Measure the space, not just the operation.** `space_size` is `:ets.info(tab, :size)`, O(1),
+so every discrete event carries it. But the signal operators actually need corresponds to no
+operation at all: a shard whose waiter count climbs while `out` volume is flat. So every
+shard emits `[:tuplex, :shard, :stats]` on a timer — `space_size`, `waiter_count`,
+`watch_count`, `lease_count`, `oldest_waiter_age_ms`. That last one is what pages someone.
+Interval is configurable (`config :tuplex, stats_interval:`), 10s by default, `:off` to
+disable; a thousand shards on a one-second timer is its own problem.
+
+`waiter_count` and `watch_count` are **maintained counters**, not computed. Flattening the
+buckets per event would turn an O(1) measurement into O(waiters) on the hot path. A test
+asserts they never drift from the real bucket contents.
+
+**Caller-side reads measure less, and say so.** `rdp` and `rd_all` execute in the caller, so
+their events fire where the waiter index is not visible. They carry `space_size` but no
+`waiter_count`. Faking it would mean a message to the shard on every read, undoing the entire
+reason those reads bypass it.
+
+Two consequences worth keeping in mind:
+
+- `[:tuplex, :out]`, `[:tuplex, :inp]`, the lease events and the stats event are emitted
+  **from inside the shard**, and `:telemetry` handlers are synchronous. A slow handler on
+  those blocks that tag entirely. Documented at the top of `Tuplex.Telemetry`.
+- `in/2` with `timeout: 0` reaches the same shard call as `inp/2`, so the operation is
+  threaded through to stop it emitting `[:tuplex, :inp]` as well as its own span. Double
+  counting an operation is how a dashboard starts lying.
+
 ### The key invariant
 
 ```
@@ -553,7 +597,7 @@ the project; there is no partial credit for a half-finished layer.
 3. Blocking `in` / `rd` with the waiter index — **done**
 4. Leases + `Tuplex.TableKeeper` — **done**
 5. `watch`, `eval`, `rd_all` — **done**
-6. **Telemetry**, as one pass over the complete surface
+6. **Telemetry**, as one pass over the complete surface — **done**
 7. Property tests (PropEr, stateful)
 8. README and docs
 

@@ -274,15 +274,15 @@ defmodule Tuplex.Store do
   `ref` must match the lease recorded on the row, so a stale expiry cannot delete a tuple
   that has since been requeued and leased to somebody else. Returns `:ok` either way.
   """
-  @spec release(tab(), seq(), reference()) :: :ok
+  @spec release(tab(), seq(), reference()) :: {:ok, Template.t()} | :error
   def release(tab, seq, ref) do
     case :ets.lookup(tab, seq) do
-      [{^seq, _tuple, {:leased, ^ref, _pid, _mode}}] ->
+      [{^seq, tuple, {:leased, ^ref, _pid, _mode}}] ->
         true = :ets.delete(tab, seq)
-        :ok
+        {:ok, tuple}
 
       _other ->
-        :ok
+        :error
     end
   end
 

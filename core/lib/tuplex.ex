@@ -30,6 +30,13 @@ defmodule Tuplex do
   Tuplex earns its place only where the coordination is genuinely anonymous and
   shape-driven.
 
+  ## Observability
+
+  Every operation emits `:telemetry` events, and `in/2` and `rd/2` are spans whose duration
+  is how long a consumer waited — the one number that says whether consumers are starved or
+  producers are behind. See `Tuplex.Telemetry`, and read its note on `tag` cardinality
+  before mapping any of it onto metric labels.
+
   ## Importing
 
   `in/2` keeps its Linda name, which collides with `Kernel.in/2`. Alias rather than import,
@@ -41,10 +48,10 @@ defmodule Tuplex do
 
   > #### Work in progress {: .warning}
   >
-  > v0.1 is still being built. Everything in the API is here — `out/1`, `in/2`, `rd/2`,
-  > `inp/2`, `rdp/1`, `rd_all/1`, `take/2`, `eval/1`, `watch/2`, `unwatch/1`, `ack/1`,
-  > `tags/0`, and leases. Still to come: telemetry across the whole surface, and the
-  > stateful property suite.
+  > v0.1 is feature-complete: `out/1`, `in/2`, `rd/2`, `inp/2`, `rdp/1`, `rd_all/1`,
+  > `take/2`, `eval/1`, `watch/2`, `unwatch/1`, `ack/1`, `tags/0`, leases, and telemetry
+  > (see `Tuplex.Telemetry`). Still to come before release: the stateful property suite and
+  > the README.
   """
 
   alias Tuplex.Shard
@@ -164,7 +171,7 @@ defmodule Tuplex do
           {:ok, Template.t()} | {:ok, Template.t(), Shard.handle()} | {:error, :timeout}
   def unquote(:in)(template, opts \\ []) do
     template = Template.validate!(template)
-    blocking(:in, template, timeout!(opts), lease!(opts))
+    span(:in, template, timeout!(opts), lease!(opts))
   end
 
   @doc """
@@ -186,7 +193,7 @@ defmodule Tuplex do
   @spec rd(Template.template(), keyword()) :: {:ok, Template.t()} | {:error, :timeout}
   def rd(template, opts \\ []) do
     template = Template.validate!(template)
-    blocking(:rd, template, timeout!(opts), no_lease!(opts))
+    span(:rd, template, timeout!(opts), no_lease!(opts))
   end
 
   @doc """
@@ -251,7 +258,9 @@ defmodule Tuplex do
   @spec rdp(Template.template()) :: {:ok, Template.t()} | :empty
   def rdp(template) do
     template = Template.validate!(template)
-    Shard.read(template)
+    result = Shard.read(template)
+    caller_event([:tuplex, :rdp], template, %{}, %{result: outcome_of(result)})
+    result
   end
 
   @doc """
@@ -287,7 +296,9 @@ defmodule Tuplex do
   @spec rd_all(Template.template()) :: [Template.t()]
   def rd_all(template) do
     template = Template.validate!(template)
-    Shard.read_all(template)
+    result = Shard.read_all(template)
+    caller_event([:tuplex, :rd_all], template, %{matched: length(result)}, %{})
+    result
   end
 
   @doc """
@@ -400,6 +411,38 @@ defmodule Tuplex do
 
   # A single funnel per operation, so that step 6 can wrap each one in a telemetry span at
   # one call site instead of threading events through several early returns.
+  # in/2 and rd/2 are the only spans, because their duration is the one operational number
+  # nothing else exposes: how long a consumer waited. Everything else gets a discrete event,
+  # since timing an ETS insert doubles the hot-path event volume for a number nobody reads.
+  defp span(mode, template, timeout, lease) do
+    {tag, arity} = Template.key(template)
+    metadata = %{tag: tag, arity: arity, timeout: timeout, lease: lease}
+
+    :telemetry.span([:tuplex, mode], metadata, fn ->
+      result = blocking(mode, template, timeout, lease)
+      {result, Map.put(metadata, :result, outcome(result))}
+    end)
+  end
+
+  defp outcome({:error, :timeout}), do: :timeout
+  defp outcome(_result), do: :ok
+
+  defp outcome_of(:empty), do: :empty
+  defp outcome_of(_result), do: :ok
+
+  # Caller-side reads fire where the waiter index is not visible. The measurement set is
+  # smaller rather than faked, because asking the shard for the rest would undo the whole
+  # reason these reads bypass it.
+  defp caller_event(event, template, measurements, metadata) do
+    {tag, arity} = Template.key(template)
+
+    :telemetry.execute(
+      event,
+      Map.merge(%{count: 1, space_size: Shard.space_size(tag)}, measurements),
+      Map.merge(%{tag: tag, arity: arity}, metadata)
+    )
+  end
+
   defp blocking(mode, template, 0, lease) do
     # A zero timeout is the non-blocking probe. Registering a waiter only to sweep it in the
     # same breath would cost two shard calls and a monitor to reach the same answer.
@@ -414,7 +457,10 @@ defmodule Tuplex do
     Shard.wait(mode, template, timeout, lease)
   end
 
-  defp probe(:in, template, lease), do: Shard.take(template, lease)
+  # The op is threaded through so the shard does not also emit an [:tuplex, :inp] event: this
+  # call is already inside an in/2 span, and counting it twice would inflate any dashboard
+  # that adds up operations.
+  defp probe(:in, template, lease), do: Shard.take(template, lease, :in)
   defp probe(:rd, template, _lease), do: Shard.read(template)
 
   defp lease!(opts) do
@@ -437,7 +483,11 @@ defmodule Tuplex do
   # The failure is reported and then re-raised, so it lands in the logs as a crash as well
   # as in telemetry. A :kill cannot be caught and so goes unreported; nothing can help that.
   defp evaluate(fun) do
-    out(fun.())
+    tuple = fun.()
+    out(tuple)
+
+    {tag, arity} = Template.key(tuple)
+    :telemetry.execute([:tuplex, :eval], %{count: 1}, %{tag: tag, arity: arity})
   catch
     kind, reason ->
       stacktrace = __STACKTRACE__
