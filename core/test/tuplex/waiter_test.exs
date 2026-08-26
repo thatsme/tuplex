@@ -127,8 +127,12 @@ defmodule Tuplex.WaiterTest do
     end
 
     test "a second taker keeps waiting", %{tag: tag, shard: shard} do
+      # Registered one at a time: tasks spawned together race, and which of the two takers
+      # is "first" is exactly what this test is about.
       reader = Task.async(fn -> Tuplex.rd({tag, :_}) end)
+      assert_registered(shard, 1)
       first = Task.async(fn -> Tuplex.in({tag, :_}) end)
+      assert_registered(shard, 2)
       second = Task.async(fn -> Tuplex.in({tag, :_}) end)
       assert_registered(shard, 3)
 

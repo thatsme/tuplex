@@ -8,7 +8,8 @@ defmodule Tuplex.StoreTest do
 
   setup do
     tab = Store.new(:store_test)
-    on_exit(fn -> if :ets.info(tab) != :undefined, do: Store.destroy(tab) end)
+    # No cleanup needed: the table is owned by this test process and dies with it. An
+    # on_exit callback runs after that process is gone, so it would only race the teardown.
     {:ok, tab: tab, seq: counter()}
   end
 

@@ -11,6 +11,10 @@ defmodule Tuplex.Application do
       # by-product of the same registry rather than a feature of its own.
       {Registry, keys: :unique, name: Tuplex.Registry},
 
+      # Heir to every shard table, so a shard crash costs a process rather than a space.
+      # Started before the shards, since they hand it their tables at creation.
+      Tuplex.TableKeeper,
+
       # Shards are started on demand by the first out/1 for a tag.
       #
       # The restart intensity is deliberately far above the default 3-in-5s. Shards are

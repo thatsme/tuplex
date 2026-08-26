@@ -41,8 +41,8 @@ defmodule Tuplex do
 
   > #### Work in progress {: .warning}
   >
-  > v0.1 is still being built. Available now: `out/1`, `in/2`, `rd/2`, `inp/1`, `rdp/1`,
-  > `take/2`, `tags/0`. Still to come: `rd_all/1`, `eval/1`, `watch/1`, leases, and
+  > v0.1 is still being built. Available now: `out/1`, `in/2`, `rd/2`, `inp/2`, `rdp/1`,
+  > `take/2`, `tags/0`, and leases. Still to come: `rd_all/1`, `eval/1`, `watch/1`, and
   > telemetry.
   """
 
@@ -56,7 +56,7 @@ defmodule Tuplex do
   the tuple has no concrete atom tag.
 
   Identical tuples do not collapse: writing `{:token}` three times means three tuples, and
-  three `inp/1` calls to drain them.
+  three `inp/2` calls to drain them.
 
   ## Examples
 
@@ -78,14 +78,50 @@ defmodule Tuplex do
   ## Options
 
     * `:timeout` — milliseconds to wait, or `:infinity` (the default). `0` does not
-      register a waiter at all; it behaves exactly like `inp/1`, reporting
-      `{:error, :timeout}` where `inp/1` would say `:empty`.
+      register a waiter at all; it behaves exactly like `inp/2`, reporting
+      `{:error, :timeout}` where `inp/2` would say `:empty`.
+
+    * `:lease` — `false` by default. When `true`, the tuple is held against the calling
+      process rather than removed outright, and comes back if that process dies without
+      finishing. See below.
 
   Exactly one blocked `in/2` receives any given tuple. Every `rd/2` waiting on a template
   that also matches is woken **first**, before this call consumes it, so a reader never
   ends up blocked on a tuple that has already been taken away.
 
   Waiters are served in the order they arrived.
+
+  ## Leasing
+
+  Without a lease, a tuple taken by a process that then crashes is simply gone. With
+  `lease: true`, the tuple stays in the space marked as held by the caller, and:
+
+    * if the caller exits **normally**, the work is taken to have been done and the tuple
+      is discarded;
+    * if it exits **any other way** — a crash, a kill, `:shutdown` from a supervisor — the
+      tuple is returned to the space and offered to the next taker.
+
+  `:shutdown` requeues along with everything else. A supervisor stopping a worker part-way
+  through is orderly, but the work still did not happen.
+
+  The lease is bound to the **lifetime of the calling process**, and there is no separate
+  acknowledgement to send: finishing means exiting normally. So lease from a process whose
+  life is the piece of work — typically a `Task` per tuple — rather than from a long-lived
+  worker that takes many tuples in a loop, which would accumulate leases it never releases.
+
+  A requeued tuple goes to the **back** of the queue, not back to its original position.
+  That is deliberate: at the front, a tuple that crashes whoever takes it would be handed
+  straight back to the next taker in a tight loop. At the back it starves instead, which is
+  visible rather than fatal.
+
+  Leased tuples are invisible to `rd/2`, `rdp/1` and other `in/2` callers while they are
+  held.
+
+      Task.async(fn ->
+        {:ok, job} = Tuplex.in({:job, :_}, lease: true)
+        process(job)
+        # exiting normally here discards the tuple; crashing returns it to the space
+      end)
 
   ## The name
 
@@ -106,7 +142,7 @@ defmodule Tuplex do
           {:ok, Template.t()} | {:error, :timeout}
   def unquote(:in)(template, opts \\ []) do
     template = Template.validate!(template)
-    blocking(:in, template, timeout!(opts))
+    blocking(:in, template, timeout!(opts), lease!(opts))
   end
 
   @doc """
@@ -128,7 +164,7 @@ defmodule Tuplex do
   @spec rd(Template.template(), keyword()) :: {:ok, Template.t()} | {:error, :timeout}
   def rd(template, opts \\ []) do
     template = Template.validate!(template)
-    blocking(:rd, template, timeout!(opts))
+    blocking(:rd, template, timeout!(opts), no_lease!(opts))
   end
 
   @doc """
@@ -156,11 +192,15 @@ defmodule Tuplex do
       #=> {:ok, {:job, 1}}
       Tuplex.inp({:job, :_})
       #=> :empty
+
+  ## Options
+
+    * `:lease` — as for `in/2`.
   """
-  @spec inp(Template.template()) :: {:ok, Template.t()} | :empty
-  def inp(template) do
+  @spec inp(Template.template(), keyword()) :: {:ok, Template.t()} | :empty
+  def inp(template, opts \\ []) do
     template = Template.validate!(template)
-    Shard.take(template)
+    Shard.take(template, lease!(opts))
   end
 
   @doc """
@@ -208,21 +248,43 @@ defmodule Tuplex do
 
   # -- internals --------------------------------------------------------------
 
-  # A single funnel per operation, so that step 8 can wrap each one in a telemetry span at
+  # A single funnel per operation, so that step 6 can wrap each one in a telemetry span at
   # one call site instead of threading events through several early returns.
-  defp blocking(mode, template, 0) do
+  defp blocking(mode, template, 0, lease?) do
     # A zero timeout is the non-blocking probe. Registering a waiter only to sweep it in the
     # same breath would cost two shard calls and a monitor to reach the same answer.
-    case probe(mode, template) do
+    case probe(mode, template, lease?) do
       {:ok, tuple} -> {:ok, tuple}
       :empty -> {:error, :timeout}
     end
   end
 
-  defp blocking(mode, template, timeout), do: Shard.wait(mode, template, timeout)
+  defp blocking(mode, template, timeout, lease?) do
+    Shard.wait(mode, template, timeout, lease?)
+  end
 
-  defp probe(:in, template), do: Shard.take(template)
-  defp probe(:rd, template), do: Shard.read(template)
+  defp probe(:in, template, lease?), do: Shard.take(template, lease?)
+  defp probe(:rd, template, _lease?), do: Shard.read(template)
+
+  defp lease!(opts) do
+    case Keyword.get(opts, :lease, false) do
+      lease? when is_boolean(lease?) ->
+        lease?
+
+      other ->
+        raise ArgumentError, ":lease must be true or false, got: #{inspect(other)}"
+    end
+  end
+
+  defp no_lease!(opts) do
+    if Keyword.has_key?(opts, :lease) do
+      raise ArgumentError,
+            ":lease applies to in/2 and inp/2 only — a non-destructive read takes nothing, " <>
+              "so there is nothing to hand back"
+    end
+
+    false
+  end
 
   defp timeout!(opts) do
     case Keyword.get(opts, :timeout, :infinity) do

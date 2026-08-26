@@ -10,10 +10,23 @@ defmodule Tuplex.Store do
 
   An `:ordered_set` keyed by a monotonically increasing sequence number:
 
-      {seq, tuple}
+      {seq, tuple}                          # free
+      {seq, tuple, {:leased, ref, pid}}     # held by a consumer
+      {seq, tuple, {:requeueing, new_seq}}  # a requeue caught mid-flight
 
   The sequence number comes from the calling shard's counter, so `Store` stays
   deterministic and testable without a process behind it.
+
+  A leased tuple is **not** removed from the table, only marked, which makes the
+  free-to-leased transition a single atomic `:ets.insert/2` under the same key. See
+  `lease/4` for why that matters. The third element also means a leased row has arity 3,
+  so the arity-2 head pattern every read uses cannot match it — leased tuples are invisible
+  to `read/2`, `read_all/2` and `take/2` for free.
+
+  Excluding them from `read/2` is a judgement rather than a necessity: a lease is a claim,
+  not a deletion, so an argument exists for showing readers what is in flight. But a leased
+  tuple will either be consumed or requeued, and surfacing an in-flight claim would make
+  `rd` results depend on consumer timing. They stay hidden.
 
   The obvious alternative, a `:duplicate_bag` keyed by the tuple's tag, does not work, and
   the reason is worth recording because it is invisible until it costs you data. A
@@ -83,10 +96,21 @@ defmodule Tuplex.Store do
 
   `:protected`, so only the owner writes and every process reads; `read_concurrency: true`
   because the read path is the parallel one.
+
+  ## Options
+
+    * `:heir` — `{pid, data}` to hand the table to if the owner dies, which is how
+      `Tuplex.TableKeeper` keeps a shard's tuples alive across a crash.
   """
-  @spec new(atom()) :: tab()
-  def new(name \\ :tuplex_store) when is_atom(name) do
-    :ets.new(name, [:ordered_set, :protected, read_concurrency: true])
+  @spec new(atom(), keyword()) :: tab()
+  def new(name \\ :tuplex_store, opts \\ []) when is_atom(name) do
+    heir =
+      case Keyword.fetch(opts, :heir) do
+        {:ok, {pid, data}} -> [{:heir, pid, data}]
+        :error -> []
+      end
+
+    :ets.new(name, [:ordered_set, :protected, {:read_concurrency, true} | heir])
   end
 
   @doc """
@@ -202,7 +226,131 @@ defmodule Tuplex.Store do
   end
 
   @doc """
-  Returns the number of tuples in the table.
+  Leases the oldest free tuple matching `template` to `pid`, without removing it.
+
+  Returns `{:ok, tuple, seq}`, or `:empty` when nothing matches.
+
+  The row is **marked in place** — `{seq, tuple}` becomes `{seq, tuple, {:leased, ref,
+  pid}}` — which an `:ordered_set` does in a single `:ets.insert/2` under the same key.
+  That atomicity is the whole point of the design.
+
+  The alternative, deleting the row and recording the lease somewhere else, cannot be done
+  in one operation, and every ordering of the two writes has a failure mode: record first
+  and a crash in between leaves the row present *and* a lease claiming it needs requeuing,
+  which is duplicate delivery; delete first and a crash in between loses the tuple with no
+  record that it ever existed, which is exactly the silent loss this library promises not
+  to do. Marking in place removes the window rather than narrowing it, and leaves the table
+  itself as the authoritative record of who holds what.
+  """
+  @spec lease(tab(), Template.template(), reference(), pid()) ::
+          {:ok, Template.t(), seq()} | :empty
+  def lease(tab, template, ref, pid) do
+    case first(tab, template) do
+      {seq, tuple} ->
+        :ok = lease_row(tab, seq, tuple, ref, pid)
+        {:ok, tuple, seq}
+
+      nil ->
+        :empty
+    end
+  end
+
+  @doc """
+  Marks the row already sitting at `seq` as leased to `pid`.
+
+  For the case where the tuple has just been written and handed straight to a waiter: it is
+  already in the table, so there is nothing to select.
+  """
+  @spec lease_row(tab(), seq(), Template.t(), reference(), pid()) :: :ok
+  def lease_row(tab, seq, tuple, ref, pid) do
+    true = :ets.insert(tab, {seq, tuple, {:leased, ref, pid}})
+    :ok
+  end
+
+  @doc """
+  Discards a leased row: the holder finished with it.
+
+  `ref` must match the lease recorded on the row, so a stale expiry cannot delete a tuple
+  that has since been requeued and leased to somebody else. Returns `:ok` either way.
+  """
+  @spec release(tab(), seq(), reference()) :: :ok
+  def release(tab, seq, ref) do
+    case :ets.lookup(tab, seq) do
+      [{^seq, _tuple, {:leased, ^ref, _pid}}] ->
+        true = :ets.delete(tab, seq)
+        :ok
+
+      _other ->
+        :ok
+    end
+  end
+
+  @doc """
+  Returns a leased row to the space at `new_seq`, as a free tuple.
+
+  Returns `{:ok, tuple}` so the caller can offer it to waiters, or `:error` if `ref` no
+  longer matches the lease on the row — which makes the call idempotent against a repeated
+  or stale expiry.
+
+  A fresh sequence number puts the tuple at the **back** of the queue rather than back
+  where it was. Reinserting at the original sequence would preserve arrival order, which is
+  arguably fairer for job dispatch, but it also means a tuple that crashes whoever takes it
+  is handed straight back to the next taker in a tight loop. At the back, the same poison
+  tuple starves rather than stalls, which is visible instead of fatal.
+
+  The three writes are ordered so that a crash at any point leaves the table recoverable:
+  the intent is recorded first, atomically, then the tuple is published at its new
+  position, then the old row retires. `recover/1` finishes whatever was interrupted.
+  """
+  @spec requeue(tab(), seq(), reference(), seq()) :: {:ok, Template.t()} | :error
+  def requeue(tab, seq, ref, new_seq) do
+    case :ets.lookup(tab, seq) do
+      [{^seq, tuple, {:leased, ^ref, _pid}}] ->
+        true = :ets.insert(tab, {seq, tuple, {:requeueing, new_seq}})
+        true = :ets.insert(tab, {new_seq, tuple})
+        true = :ets.delete(tab, seq)
+        {:ok, tuple}
+
+      _other ->
+        :error
+    end
+  end
+
+  @doc """
+  Prepares a reclaimed table for use and reports the leases still recorded in it.
+
+  Finishes any requeue that a crash interrupted — idempotently, by checking whether the
+  tuple already reached its new position — and then returns `{seq, tuple, ref, pid}` for
+  every row still marked leased.
+
+  This is authoritative precisely because the table *is* the record. There is no second
+  structure to reconcile it against and no way for the two to disagree.
+
+  Call it before `next_seq/1`, since finishing a requeue can add a row.
+  """
+  @spec recover(tab()) :: [{seq(), Template.t(), reference(), pid()}]
+  def recover(tab) do
+    rows = held(tab)
+
+    for {seq, tuple, {:requeueing, new_seq}} <- rows do
+      if :ets.lookup(tab, new_seq) == [], do: :ets.insert(tab, {new_seq, tuple})
+      :ets.delete(tab, seq)
+    end
+
+    for {seq, tuple, {:leased, ref, pid}} <- rows, do: {seq, tuple, ref, pid}
+  end
+
+  @doc """
+  Returns `{seq, tuple, ref, pid}` for every currently leased row. For tests and
+  introspection.
+  """
+  @spec leased(tab()) :: [{seq(), Template.t(), reference(), pid()}]
+  def leased(tab) do
+    for {seq, tuple, {:leased, ref, pid}} <- held(tab), do: {seq, tuple, ref, pid}
+  end
+
+  @doc """
+  Returns the number of rows in the table, leased ones included.
   """
   @spec size(tab()) :: non_neg_integer()
   def size(tab), do: :ets.info(tab, :size)
@@ -226,6 +374,13 @@ defmodule Tuplex.Store do
 
   defp spec(template) do
     {head, guards} = Template.compile!(template)
+
+    # A two-element head. A leased row is a three-element record, so it cannot match this
+    # pattern at all — excluding leases from every read costs nothing, not even a guard,
+    # because arity is already part of how ETS matches.
     [{{:_, head}, guards, [:"$_"]}]
   end
+
+  # Every row carrying a third element: leased, or mid-requeue.
+  defp held(tab), do: :ets.select(tab, [{{:_, :_, :_}, [], [:"$_"]}])
 end

@@ -69,8 +69,12 @@ alexdont, 0.3.5, ~12k downloads. Hence the rename to Tuplex. Both `tuplex` and
 - `rd_all/2` — non-destructive read of every match
 - `eval/2` — evaluate a function in a fresh process, `out` its result
 - `watch/2` — subscribe to tuples matching a template as they are written
-- **leases** — a tuple can be bound to a pid via `Process.monitor` and is removed when that
-  pid dies
+- **leases** — `in`/`inp` can hold a tuple against the taking process via `Process.monitor`
+  rather than removing it outright, returning it to the space if that process dies without
+  finishing. (The first session's notes described this the other way round, as an `out`
+  option removing a tuple when its *writer* died. That is a different feature — a
+  self-expiring lock rather than at-least-once delivery — and is not built. Worth a ruling
+  on whether it is still wanted.)
 - **tag-based shard partitioning** — the tuple's first element selects the shard
 - **telemetry** — `:telemetry` events on the operations above
 
@@ -95,7 +99,7 @@ The module `Tuplex` is the only public surface. Everything else is internal.
 
 ```elixir
 Tuplex.out({:job, 1, "payload"})               # :ok
-Tuplex.out({:lock, :db}, lease: self())        # removed when the caller dies
+Tuplex.in({:job, :_}, lease: true)             # comes back if the taker dies
 
 Tuplex.in({:job, :_, :_})                      # blocks: {:ok, tuple} | {:error, :timeout}
 Tuplex.in({:job, :_, :_}, timeout: 5_000)
@@ -378,6 +382,82 @@ Two races that have to be handled rather than hoped away:
   crash does not change that contract. The caller monitors the shard and re-registers with
   its replacement rather than hanging forever or reporting a timeout that did not happen.
 
+### Leases
+
+`in(template, lease: true)` hands the tuple to the caller **without removing it**. The
+tuple comes back if the caller dies without finishing, so a consumer crash costs a retry
+rather than a tuple.
+
+The trap is not the lease mechanism — that is `Process.monitor` plus a map — it is the
+crash window between recording a lease and removing the row. Those are two writes and they
+are not atomic, and every ordering has a failure mode:
+
+- **Record the lease first, then delete the row.** A crash in between leaves the row
+  present *and* a lease claiming it needs requeuing. Duplicate delivery.
+- **Delete the row first, then record.** A crash in between loses the tuple with no record
+  it ever existed. Silent loss — the failure this library exists not to have.
+
+The way out is **not to delete the row at all**. It is marked in place:
+
+```elixir
+{seq, tuple}                          # free
+{seq, tuple, {:leased, ref, pid}}     # held
+{seq, tuple, {:requeueing, new_seq}}  # a requeue caught mid-flight
+```
+
+On an `:ordered_set` a single `:ets.insert/2` replaces the row under the same key, so the
+free-to-leased transition is one operation with no window at all. Requeueing is another
+single insert stripping the third element. And recovery after a shard crash is a select for
+marked rows, which is **authoritative because the table is the record** — there is no
+second structure to reconcile against and no way for the two to disagree.
+
+The cost is that reads must exclude leased rows, and it turns out to be free: a leased row
+has arity 3, and the arity-2 head pattern every read already uses cannot match it. Not even
+a guard, and `Template` still knows nothing about any of it.
+
+**`rd` does not see leased tuples.** Arguable — a lease is a claim, not a deletion. But a
+leased tuple will either be consumed or requeued, and exposing an in-flight claim would
+make `rd` results depend on consumer timing. Excluded, and documented.
+
+**Requeue goes to a fresh sequence, at the back.** Reinserting at the original sequence
+would preserve arrival order, which is fairer for job dispatch, but a tuple that crashes
+whoever takes it would then be handed straight back to the next taker in a tight loop. At
+the back the same poison tuple starves rather than stalls — visible instead of fatal. A
+requeue count for a later poison detector would have to survive the requeue, meaning it
+would have to live in the *free* row, which changes the arity guard. Deliberately deferred
+rather than half-built.
+
+**Only `:normal` discards.** Every other exit reason requeues, `:shutdown` and
+`{:shutdown, _}` included: a supervisor stopping a worker mid-lease is orderly, but the
+work still did not happen. A worker that finished should exit normally, or the lease was
+the wrong tool.
+
+The lease is bound to the calling process's lifetime and there is no separate
+acknowledgement, so callers should lease from a process whose life *is* the piece of work —
+a `Task` per tuple — not from a long-lived worker looping over many.
+
+### The three-write requeue
+
+Requeueing at a fresh sequence is the one place that needs more than one write, so the
+order makes it recoverable rather than atomic: mark the intent at the old key, publish the
+tuple at the new key, retire the old row. `Store.recover/1` finishes whatever was
+interrupted, idempotently, by checking whether the tuple already reached its new position.
+
+### `Tuplex.TableKeeper`
+
+Heir to every shard table. A shard's tuples now outlive its process: the table is handed to
+the keeper on death and claimed back by the replacement, which then recovers the leases
+recorded in it — re-monitoring holders that are still alive and requeueing those that are
+not.
+
+The keeper deliberately does almost nothing, because tables whose heir is a dead process
+die with it. Its one job is staying alive, and the way to guarantee that is to have no
+logic that could fail.
+
+One window is at-least-once rather than exactly-once and cannot be closed: a holder that
+finished and exited normally *while the shard was down* leaves no record of why it exited,
+so its tuple is requeued as though the work had failed. Losing it instead would be worse.
+
 ### The key invariant
 
 ```
@@ -397,7 +477,7 @@ the project; there is no partial credit for a half-finished layer.
 1. `Tuplex.Template` + `Tuplex.Store`, with full unit tests — **done**
 2. `Tuplex.Shard` + `Tuplex.Registry` — `out`, `inp`, `rdp`, `tags` — **done**
 3. Blocking `in` / `rd` with the waiter index — **done**
-4. Leases + `Tuplex.TableKeeper`
+4. Leases + `Tuplex.TableKeeper` — **done**
 5. `watch`, `eval`, `rd_all`
 6. **Telemetry**, as one pass over the complete surface
 7. Property tests (PropEr, stateful)

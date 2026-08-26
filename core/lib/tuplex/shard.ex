@@ -39,8 +39,14 @@ defmodule Tuplex.Shard do
   Re-resolving can hand back the *same* dead reference, because the registry's cleanup of a
   dead shard is asynchronous and a read can land inside that window. Retrying there would
   only raise the same error again, so the shard's liveness decides: a dead shard means the
-  tag's table died with it and an empty space is the honest answer, while a live shard
-  registered against a table it does not have is a bug and is left to raise.
+  reference cannot be reached from here and an empty space is the honest answer, while a
+  live shard registered against a table it does not have is a bug and is left to raise.
+
+  In practice this path is rare now that `Tuplex.TableKeeper` inherits a dead shard's table.
+  A table survives its shard, keeping the same reference, so a caller holding one across a
+  crash usually keeps reading successfully and the replacement reclaims the very same table.
+  The retry covers what is left: a table genuinely destroyed, which needs the keeper to have
+  gone too.
 
   **Asymmetric freshness.** `take/1` is serialised and exact: what it returns was in the
   space and is now yours. `read/1` is lock-free and returns a snapshot that may already be
@@ -94,6 +100,7 @@ defmodule Tuplex.Shard do
   use GenServer
 
   alias Tuplex.Store
+  alias Tuplex.TableKeeper
   alias Tuplex.Template
 
   @registry Tuplex.Registry
@@ -103,7 +110,7 @@ defmodule Tuplex.Shard do
   # crash dumps. A constant keeps shard creation from minting a fresh atom per tag.
   @table_label :tuplex_shard
 
-  defstruct [:tag, :tab, :seq, waiters: %{}, index: %{}, monitors: %{}]
+  defstruct [:tag, :tab, :seq, waiters: %{}, index: %{}, monitors: %{}, leases: %{}]
 
   @typedoc "The tag a shard is responsible for."
   @type tag :: atom()
@@ -155,12 +162,12 @@ defmodule Tuplex.Shard do
   Returns `:empty` when nothing matches, and does not start a shard: a tag with no shard
   has nothing to take.
   """
-  @spec take(Template.template()) :: {:ok, Template.t()} | :empty
-  def take(template) do
+  @spec take(Template.template(), boolean()) :: {:ok, Template.t()} | :empty
+  def take(template, lease? \\ false) do
     {tag, _arity} = Template.key(template)
 
     case lookup(tag) do
-      {:ok, pid, _tab} -> GenServer.call(pid, {:take, template})
+      {:ok, pid, _tab} -> GenServer.call(pid, {:take, template, lease?})
       :error -> :empty
     end
   end
@@ -200,10 +207,10 @@ defmodule Tuplex.Shard do
   it answers immediately, either with a tuple already in the table or with an
   acknowledgement that the caller is now registered.
   """
-  @spec wait(mode(), Template.template(), timeout()) ::
+  @spec wait(mode(), Template.template(), timeout(), boolean()) ::
           {:ok, Template.t()} | {:error, :timeout}
-  def wait(mode, template, timeout) do
-    wait_until(mode, template, deadline(timeout))
+  def wait(mode, template, timeout, lease? \\ false) do
+    wait_until(mode, template, deadline(timeout), lease?)
   end
 
   @doc """
@@ -251,34 +258,34 @@ defmodule Tuplex.Shard do
 
   # -- waiting, in the calling process ----------------------------------------
 
-  defp wait_until(mode, template, deadline) do
+  defp wait_until(mode, template, deadline, lease?) do
     {tag, _arity} = Template.key(template)
 
     with {:ok, pid} <- ensure(tag) do
       ref = make_ref()
       mref = Process.monitor(pid)
-      outcome = register_and_block(pid, mref, mode, template, ref, deadline)
+      outcome = register_and_block(pid, mref, mode, template, ref, deadline, lease?)
       Process.demonitor(mref, [:flush])
 
       case outcome do
         # The shard died holding our registration. Blocking means "until a matching tuple
         # arrives", and a crash does not change that contract, so file with its replacement
         # rather than leaving the caller hung or lying about a timeout.
-        :shard_died -> retry(mode, template, deadline)
+        :shard_died -> retry(mode, template, deadline, lease?)
         result -> result
       end
     end
   end
 
-  defp retry(mode, template, deadline) do
+  defp retry(mode, template, deadline, lease?) do
     case remaining(deadline) do
       0 -> {:error, :timeout}
-      _ -> wait_until(mode, template, deadline)
+      _ -> wait_until(mode, template, deadline, lease?)
     end
   end
 
-  defp register_and_block(pid, mref, mode, template, ref, deadline) do
-    case safe_call(pid, {:wait, mode, template, ref}) do
+  defp register_and_block(pid, mref, mode, template, ref, deadline, lease?) do
+    case safe_call(pid, {:wait, mode, template, ref, lease?}) do
       {:ok, tuple} -> {:ok, tuple}
       :waiting -> block(pid, ref, mref, deadline)
       :down -> :shard_died
@@ -324,13 +331,38 @@ defmodule Tuplex.Shard do
 
   @impl true
   def init(tag) do
-    tab = Store.new(@table_label)
+    tab = acquire(tag)
 
     # The name was registered before init/1 with a nil value; fill in the table now that it
     # exists, so readers can find it without going through this process.
     {_new, _old} = Registry.update_value(@registry, tag, fn _ -> tab end)
 
-    {:ok, %__MODULE__{tag: tag, tab: tab, seq: Store.next_seq(tab)}}
+    # Reconcile a reclaimed table before reading the counter off it: finishing an
+    # interrupted requeue can add a row.
+    state = reclaim_leases(%__MODULE__{tag: tag, tab: tab, seq: 1}, Store.recover(tab))
+
+    {:ok, %{state | seq: Store.next_seq(tab)}}
+  end
+
+  defp acquire(tag) do
+    case TableKeeper.claim(tag) do
+      {:ok, tab} -> tab
+      :none -> Store.new(@table_label, heir: {Process.whereis(TableKeeper), tag})
+    end
+  end
+
+  # Re-monitor the holders recorded in a reclaimed table. Monitoring is unconditional: a
+  # holder that died while the shard was down produces an immediate :DOWN with :noproc,
+  # which requeues through exactly the same path as any other abnormal exit.
+  #
+  # That window is the one place leasing is at-least-once rather than exactly-once. If a
+  # holder finished its work and exited normally while the shard was down, the exit reason
+  # is gone with the shard and the tuple is requeued as though the work had failed. Losing
+  # it instead would be worse.
+  defp reclaim_leases(state, recovered) do
+    Enum.reduce(recovered, state, fn {seq, _tuple, ref, pid}, acc ->
+      hold(acc, pid, seq, ref)
+    end)
   end
 
   @impl true
@@ -344,17 +376,20 @@ defmodule Tuplex.Shard do
     {:reply, {:ok, seq}, state}
   end
 
-  def handle_call({:take, template}, _from, state) do
-    {:reply, Store.take(state.tab, template), state}
+  def handle_call({:take, template, lease?}, {pid, _tag}, state) do
+    case satisfy(state, :in, template, lease?, pid) do
+      {:ok, tuple, state} -> {:reply, {:ok, tuple}, state}
+      :empty -> {:reply, :empty, state}
+    end
   end
 
-  def handle_call({:wait, mode, template, ref}, {pid, _tag}, state) do
+  def handle_call({:wait, mode, template, ref, lease?}, {pid, _tag}, state) do
     # A waiter is only filed if the space cannot satisfy it right now. Registration and
     # `out` are both serialised here, so there is no window between the two in which a
     # matching tuple could sit unnoticed while the caller blocks.
-    case satisfy(state, mode, template) do
-      {:ok, tuple} -> {:reply, {:ok, tuple}, state}
-      :empty -> {:reply, :waiting, register(state, mode, template, ref, pid)}
+    case satisfy(state, mode, template, lease?, pid) do
+      {:ok, tuple, state} -> {:reply, {:ok, tuple}, state}
+      :empty -> {:reply, :waiting, register(state, mode, template, ref, pid, lease?)}
     end
   end
 
@@ -367,19 +402,78 @@ defmodule Tuplex.Shard do
   end
 
   @impl true
-  def handle_info({:DOWN, mref, :process, _pid, _reason}, state) do
-    case Map.fetch(state.monitors, mref) do
-      {:ok, ref} -> {:noreply, forget(state, ref)}
-      :error -> {:noreply, state}
-    end
+  def handle_info({:DOWN, mref, :process, _pid, reason}, state) do
+    # One monitor ref means one of two things, and they live in different maps: a blocked
+    # caller that has gone away, or a lease holder that has finished or failed.
+    state =
+      case Map.fetch(state.monitors, mref) do
+        {:ok, ref} -> forget(state, ref)
+        :error -> state
+      end
+
+    state =
+      case Map.pop(state.leases, mref) do
+        {nil, _leases} -> state
+        {{seq, ref}, leases} -> settle(%{state | leases: leases}, seq, ref, reason)
+      end
+
+    {:noreply, state}
   end
+
+  # The ETS-TRANSFER that follows a claim from the keeper is only a notification; ownership
+  # already moved when give_away/3 was called.
+  def handle_info({:"ETS-TRANSFER", _tab, _from, _data}, state), do: {:noreply, state}
 
   def handle_info(_message, state), do: {:noreply, state}
 
+  # -- leases -----------------------------------------------------------------
+
+  # Only a normal exit means the work was done. Everything else requeues, :shutdown and
+  # {:shutdown, _} included: a supervisor stopping a worker mid-lease is orderly, but the
+  # work still did not happen. A holder that finished should exit normally, or the lease
+  # was the wrong tool for it.
+  defp settle(state, seq, ref, :normal) do
+    :ok = Store.release(state.tab, seq, ref)
+    state
+  end
+
+  defp settle(state, seq, ref, _reason) do
+    new_seq = state.seq
+
+    case Store.requeue(state.tab, seq, ref, new_seq) do
+      {:ok, tuple} ->
+        # A requeued tuple is a fresh arrival as far as waiters are concerned — somebody may
+        # already be blocked on it.
+        serve(%{state | seq: new_seq + 1}, tuple, new_seq)
+
+      :error ->
+        state
+    end
+  end
+
+  defp hold(state, pid, seq, ref) do
+    mref = Process.monitor(pid)
+    %{state | leases: Map.put(state.leases, mref, {seq, ref})}
+  end
+
   # -- serving ----------------------------------------------------------------
 
-  defp satisfy(state, :in, template), do: Store.take(state.tab, template)
-  defp satisfy(state, :rd, template), do: Store.read(state.tab, template)
+  defp satisfy(state, :rd, template, _lease?, _pid) do
+    with {:ok, tuple} <- Store.read(state.tab, template), do: {:ok, tuple, state}
+  end
+
+  defp satisfy(state, :in, template, false, _pid) do
+    with {:ok, tuple} <- Store.take(state.tab, template), do: {:ok, tuple, state}
+  end
+
+  defp satisfy(state, :in, template, true, pid) do
+    ref = make_ref()
+
+    case Store.lease(state.tab, template, ref, pid) do
+      {:ok, tuple, seq} -> {:ok, tuple, hold(state, pid, seq, ref)}
+      :empty -> :empty
+    end
+  end
 
   defp serve(state, tuple, seq) do
     case Map.get(state.waiters, Template.key(tuple)) do
@@ -403,13 +497,25 @@ defmodule Tuplex.Shard do
         # a tuple that has already come and gone.
         case takers do
           [taker | _rest] ->
-            :ok = Store.delete(state.tab, seq)
-            deliver(state, taker, tuple)
+            state |> consume(taker, seq, tuple) |> deliver(taker, tuple)
 
           [] ->
             state
         end
     end
+  end
+
+  defp consume(state, %{lease: false}, seq, _tuple) do
+    :ok = Store.delete(state.tab, seq)
+    state
+  end
+
+  defp consume(state, %{lease: true, pid: pid}, seq, tuple) do
+    # The row is already in the table, so marking it leased is one insert under the key it
+    # already has — the same atomic transition the immediate path gets.
+    ref = make_ref()
+    :ok = Store.lease_row(state.tab, seq, tuple, ref, pid)
+    hold(state, pid, seq, ref)
   end
 
   defp deliver(state, waiter, tuple) do
@@ -419,10 +525,10 @@ defmodule Tuplex.Shard do
 
   # -- the waiter index -------------------------------------------------------
 
-  defp register(state, mode, template, ref, pid) do
+  defp register(state, mode, template, ref, pid, lease?) do
     key = Template.key(template)
     mref = Process.monitor(pid)
-    waiter = %{ref: ref, pid: pid, mode: mode, template: template, monitor: mref}
+    waiter = %{ref: ref, pid: pid, mode: mode, template: template, monitor: mref, lease: lease?}
 
     %{
       state
@@ -472,10 +578,10 @@ defmodule Tuplex.Shard do
         fun.(fresh)
 
       # The registry still names the table that just failed. If the shard is gone, the
-      # registry has simply not processed the exit yet — the tag's table died with it, so
-      # an empty space is the honest answer and retrying would only raise again. If the
-      # shard is alive, it is registered against a table it does not have, which is a bug
-      # worth surfacing rather than swallowing.
+      # registry has simply not processed the exit yet, and the reference cannot be reached
+      # from here, so an empty space is the honest answer and retrying would only raise
+      # again. If the shard is alive, it is registered against a table it does not have,
+      # which is a bug worth surfacing rather than swallowing.
       {:ok, pid, _same} ->
         if Process.alive?(pid), do: fun.(stale), else: default
 

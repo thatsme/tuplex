@@ -197,7 +197,7 @@ defmodule Tuplex.ShardTest do
       end
     end
 
-    test "a read spanning a shard's death returns empty rather than raising", %{tag: tag} do
+    test "a read spanning a shard's death never raises", %{tag: tag} do
       Shard.out({tag, 1})
       {:ok, pid, _tab} = Shard.lookup(tag)
 
@@ -205,11 +205,23 @@ defmodule Tuplex.ShardTest do
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
 
-      # The shard's table died with it. Whether the registry has been cleaned up yet or a
-      # replacement shard is already registered, the answer is an empty space — never a
-      # raised ArgumentError from a table that is gone.
-      assert :empty = Shard.read({tag, :_})
-      assert [] = Shard.read_all({tag, :_})
+      # Whether the registry has been cleaned up yet, or a replacement shard has already
+      # claimed the table back from Tuplex.TableKeeper, the read has to answer rather than
+      # raise ArgumentError at a table it can no longer reach.
+      assert Shard.read({tag, :_}) in [:empty, {:ok, {tag, 1}}]
+      assert Shard.read_all({tag, :_}) in [[], [{tag, 1}]]
+    end
+
+    test "the tuple is still there once the replacement shard has it", %{tag: tag} do
+      Shard.out({tag, 1})
+      {:ok, pid, _tab} = Shard.lookup(tag)
+
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      # The keeper held the table across the crash, so the tuple outlives the shard.
+      assert wait_until(fn -> Shard.read({tag, :_}) == {:ok, {tag, 1}} end)
     end
   end
 
