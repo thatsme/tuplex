@@ -1,17 +1,28 @@
 defmodule Tuplex.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/thatsme/tuplex"
+
+  @description """
+  A Linda tuple space for the BEAM. Processes coordinate by writing tuples into a shared
+  store and reading them by pattern rather than by address, decoupling producer and
+  consumer in time, space, and reference.
+  """
+
   def project do
     [
       app: :tuplex,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
+      description: @description,
+      package: package(),
+      docs: docs(),
       deps: deps()
     ]
   end
 
-  # Run "mix help compile.app" to learn about applications.
   def application do
     [
       extra_applications: [:logger],
@@ -19,11 +30,27 @@ defmodule Tuplex.MixProject do
     ]
   end
 
-  # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
+      {:telemetry, "~> 1.2"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib mix.exs README.md .formatter.exs)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "Tuplex",
+      source_url: @source_url,
+      source_ref: "v#{@version}",
+      extras: ["README.md"]
     ]
   end
 end
