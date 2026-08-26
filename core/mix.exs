@@ -49,7 +49,8 @@ defmodule Tuplex.MixProject do
 
   defp docs do
     [
-      main: "Tuplex",
+      main: "readme",
+      markdown_processor: {ExDoc.Markdown.Earmark, [footnotes: true]},
       source_url: @source_url,
       source_ref: "v#{@version}",
       extras: ["README.md"]
