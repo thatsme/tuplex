@@ -30,11 +30,20 @@ defmodule Tuplex do
   Tuplex earns its place only where the coordination is genuinely anonymous and
   shape-driven.
 
+  ## Importing
+
+  `in/2` keeps its Linda name, which collides with `Kernel.in/2`. Alias rather than import,
+  or import with the clash excluded:
+
+      import Tuplex, except: [in: 2]
+
+  `take/2` is an alias for `in/2` if you would rather not deal with the name at all.
+
   > #### Work in progress {: .warning}
   >
-  > v0.1 is still being built. Available now: `out/1`, `inp/1`, `rdp/1`, `tags/0`. The
-  > blocking reads `in/2` and `rd/2`, plus `rd_all/1`, `eval/1`, `watch/1` and leases, are
-  > not implemented yet.
+  > v0.1 is still being built. Available now: `out/1`, `in/2`, `rd/2`, `inp/1`, `rdp/1`,
+  > `take/2`, `tags/0`. Still to come: `rd_all/1`, `eval/1`, `watch/1`, leases, and
+  > telemetry.
   """
 
   alias Tuplex.Shard
@@ -60,6 +69,73 @@ defmodule Tuplex do
     {:ok, _seq} = Shard.out(tuple)
     :ok
   end
+
+  @doc """
+  Blocks until a tuple matching `template` is available, then removes and returns it.
+
+  Returns `{:ok, tuple}`, or `{:error, :timeout}` if the wait runs out.
+
+  ## Options
+
+    * `:timeout` — milliseconds to wait, or `:infinity` (the default). `0` does not
+      register a waiter at all; it behaves exactly like `inp/1`, reporting
+      `{:error, :timeout}` where `inp/1` would say `:empty`.
+
+  Exactly one blocked `in/2` receives any given tuple. Every `rd/2` waiting on a template
+  that also matches is woken **first**, before this call consumes it, so a reader never
+  ends up blocked on a tuple that has already been taken away.
+
+  Waiters are served in the order they arrived.
+
+  ## The name
+
+  `in` is a binary operator in Elixir, so this is defined as `def unquote(:in)`. That is
+  invisible at the call site but it does mean `import Tuplex` clashes with `Kernel.in/2` —
+  alias the module, import with `except: [in: 2]`, or use `take/2`.
+
+  ## Examples
+
+      Task.async(fn -> Tuplex.in({:job, :_}) end)
+      Tuplex.out({:job, 1})
+      #=> the blocked task returns {:ok, {:job, 1}}
+
+      Tuplex.in({:nothing, :_}, timeout: 10)
+      #=> {:error, :timeout}
+  """
+  @spec unquote(:in)(Template.template(), keyword()) ::
+          {:ok, Template.t()} | {:error, :timeout}
+  def unquote(:in)(template, opts \\ []) do
+    template = Template.validate!(template)
+    blocking(:in, template, timeout!(opts))
+  end
+
+  @doc """
+  Blocks until a tuple matching `template` is available, then returns it without removing
+  it.
+
+  Returns `{:ok, tuple}`, or `{:error, :timeout}` if the wait runs out. Takes the same
+  `:timeout` option as `in/2`, where `0` behaves like `rdp/1`.
+
+  **Every** waiting `rd/2` whose template matches an arriving tuple is woken, not just one
+  — a non-destructive read has no reason to be exclusive.
+
+  ## Examples
+
+      Task.async(fn -> Tuplex.rd({:config, :_}) end)
+      Tuplex.out({:config, %{mode: :fast}})
+      #=> the blocked task returns {:ok, {:config, %{mode: :fast}}}, tuple still in place
+  """
+  @spec rd(Template.template(), keyword()) :: {:ok, Template.t()} | {:error, :timeout}
+  def rd(template, opts \\ []) do
+    template = Template.validate!(template)
+    blocking(:rd, template, timeout!(opts))
+  end
+
+  @doc """
+  An alias for `in/2`, for callers who would rather not work around the operator name.
+  """
+  @spec take(Template.template(), keyword()) :: {:ok, Template.t()} | {:error, :timeout}
+  defdelegate take(template, opts \\ []), to: __MODULE__, as: :in
 
   @doc """
   Removes and returns the oldest tuple matching `template`, without blocking.
@@ -129,4 +205,36 @@ defmodule Tuplex do
   """
   @spec tags() :: [atom()]
   defdelegate tags(), to: Shard
+
+  # -- internals --------------------------------------------------------------
+
+  # A single funnel per operation, so that step 8 can wrap each one in a telemetry span at
+  # one call site instead of threading events through several early returns.
+  defp blocking(mode, template, 0) do
+    # A zero timeout is the non-blocking probe. Registering a waiter only to sweep it in the
+    # same breath would cost two shard calls and a monitor to reach the same answer.
+    case probe(mode, template) do
+      {:ok, tuple} -> {:ok, tuple}
+      :empty -> {:error, :timeout}
+    end
+  end
+
+  defp blocking(mode, template, timeout), do: Shard.wait(mode, template, timeout)
+
+  defp probe(:in, template), do: Shard.take(template)
+  defp probe(:rd, template), do: Shard.read(template)
+
+  defp timeout!(opts) do
+    case Keyword.get(opts, :timeout, :infinity) do
+      :infinity ->
+        :infinity
+
+      timeout when is_integer(timeout) and timeout >= 0 ->
+        timeout
+
+      other ->
+        raise ArgumentError,
+              ":timeout must be a non-negative integer or :infinity, got: #{inspect(other)}"
+    end
+  end
 end

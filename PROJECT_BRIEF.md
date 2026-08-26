@@ -329,6 +329,55 @@ Consequence for `$`-atoms: they are rejected only where they would reach the hea
 hoisted subterm they land in a `{:const, _}` and are never interpreted, so
 `{:cfg, %{name: :"$1"}}` is accepted.
 
+### Waiters
+
+`in` and `rd` block **in the calling process**, never inside the shard. Registering a
+waiter is a fast call that either satisfies the read from the table or files the caller and
+returns; the caller then sits in its own `receive`. A shard that blocked on a caller's
+behalf would stop serving every other process using that tag.
+
+Waiters are filed by `Template.key/1`. The key **narrows the candidate set; it does not
+decide the match** — two waiters can share a key and hold different templates, so
+`matches?/2` is still evaluated per waiter inside the bucket. Two waiters whose templates
+both match one tuple necessarily share a key, since the tuple fixes both tag and arity;
+that is the key invariant earning its keep.
+
+**Readers before the taker.** When a tuple arrives, every matching `rd` waiter is woken
+first, and only then is the tuple handed to exactly one `in` waiter, which consumes it.
+Satisfying the taker first would delete the tuple while readers that legitimately matched
+it were still blocked, and they would go on blocking for a tuple that had already been and
+gone. Another silent hang.
+
+**Insert before serve.** The tuple is inserted before any waiter is served, even when a
+waiter takes it in the same breath: insert, serve the readers, then delete on behalf of the
+taker. The other order leaves a window in which a concurrent caller-side read sees a gap
+where the tuple never existed, and puts a hole in the sequence accounting.
+
+**Arrival order among waiters.** Linda leaves the choice unspecified, and prepending to a
+list would make service LIFO by accident — contradicting the FIFO the store already
+guarantees for tuples. Buckets are stored newest-first because prepending is O(1), and
+reversed when served. Deliberate, not whatever the cons cell produced.
+
+**Blocked callers are monitored.** A caller that dies, or times out and walks away, would
+otherwise leave a waiter that matches forever and silently swallows a tuple meant for a
+live consumer — a leak that only shows up under load. Monitor on registration, drop on
+`:DOWN`, demonitor on service or cancel.
+
+**`timeout: 0` does not register a waiter.** It is the non-blocking probe, behaving exactly
+as `inp` / `rdp` but reporting `{:error, :timeout}` in place of `:empty`. Registering a
+waiter only to sweep it in the same breath would cost two shard calls and a monitor to
+reach the same answer.
+
+Two races that have to be handled rather than hoped away:
+
+- **Timeout racing service.** A caller can time out in the instant the shard serves it, in
+  which case the tuple has already left the space and dropping it would lose it outright.
+  After the cancel is acknowledged the caller checks its mailbox once — both messages come
+  from the shard, so ordering guarantees the tuple is already there if it was sent.
+- **Shard death during a wait.** Blocking means "until a matching tuple arrives", and a
+  crash does not change that contract. The caller monitors the shard and re-registers with
+  its replacement rather than hanging forever or reporting a timeout that did not happen.
+
 ### The key invariant
 
 ```
@@ -347,11 +396,23 @@ the project; there is no partial credit for a half-finished layer.
 
 1. `Tuplex.Template` + `Tuplex.Store`, with full unit tests — **done**
 2. `Tuplex.Shard` + `Tuplex.Registry` — `out`, `inp`, `rdp`, `tags` — **done**
-3. Blocking `in` / `rd` with the waiter index
+3. Blocking `in` / `rd` with the waiter index — **done**
 4. Leases + `Tuplex.TableKeeper`
 5. `watch`, `eval`, `rd_all`
-6. Property tests (PropEr, stateful)
-7. README and docs
+6. **Telemetry**, as one pass over the complete surface
+7. Property tests (PropEr, stateful)
+8. README and docs
+
+Telemetry gets its own step rather than being folded into each operation as it is built.
+It is cross-cutting: adding it per-op means revising event names and measurement shapes
+with every new operation, so the retroactive pass happens either way, just spread thinner
+and with a less coherent vocabulary at the end. One pass over a finished surface produces
+one vocabulary.
+
+What that costs now is a discipline, not code: **every operation must have a single funnel
+point where a span can wrap it**, rather than several early returns per function. Each
+public function in `Tuplex` therefore validates and then makes exactly one call to an
+internal function that produces the result.
 
 ## 8. Settled decisions
 
