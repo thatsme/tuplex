@@ -1,0 +1,13 @@
+# Language server / editor caches
+.elixir_ls/
+.lexical/
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment overrides
+.env
