@@ -1,6 +1,4 @@
 defmodule Tuplex.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
@@ -8,13 +6,23 @@ defmodule Tuplex.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: Tuplex.Worker.start_link(arg)
-      # {Tuplex.Worker, arg}
+      # Resolves a tag to its shard's pid *and* table reference. The table reference is what
+      # lets non-destructive reads run in the calling process, and Tuplex.tags/0 is a
+      # by-product of the same registry rather than a feature of its own.
+      {Registry, keys: :unique, name: Tuplex.Registry},
+
+      # Shards are started on demand by the first out/1 for a tag.
+      #
+      # The restart intensity is deliberately far above the default 3-in-5s. Shards are
+      # independent of one another, so pooling their failures into one tight budget means a
+      # handful of unrelated shard crashes takes down the supervisor and every other tag's
+      # tuples with it — the blast radius of a crash should be one tag, not the space. The
+      # cap is raised rather than removed so a shard that genuinely cannot start still gives
+      # up instead of spinning.
+      {DynamicSupervisor,
+       name: Tuplex.ShardSupervisor, strategy: :one_for_one, max_restarts: 100, max_seconds: 5}
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: Tuplex.Supervisor]
-    Supervisor.start_link(children, opts)
+    Supervisor.start_link(children, strategy: :one_for_one, name: Tuplex.Supervisor)
   end
 end

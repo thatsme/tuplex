@@ -124,6 +124,13 @@ visible at the call site, and it never leaks into the hot API.
 `take/2` is a formatter-friendly alias for `in/2`, via
 `defdelegate take(t, o), to: __MODULE__, as: :in`.
 
+**Arities arrive with the options that justify them.** As built, `out/1`, `inp/1` and
+`rdp/1` take no options because none exist yet; `timeout:` arrives with the blocking reads
+at step 3 and `lease:` with step 4. Adding a defaulted second parameter later
+(`def out(tuple, opts \\ [])`) defines both arities and breaks no existing call, so there
+is nothing to gain from carrying an ignored `opts` around in the meantime — and an ignored
+parameter is exactly the kind of stub §4 forbids.
+
 ### The `in` naming decision
 
 The public API keeps the Linda name `Tuplex.in/2`. This is awkward at the definition site
@@ -152,16 +159,89 @@ Do not "fix" the `unquote` form to a plain `def`. It will not compile.
 ## 6. Architecture
 
 ```
-Tuplex                   public API, delegation + argument validation
-  └─ Tuplex.Shard        GenServer, one per shard — owns blocking waiters, leases, watches
-       └─ Tuplex.Store   pure functions over one ETS table — the ONLY module that touches :ets
-  Tuplex.Template        pure — validation, key extraction, match-spec construction
-  Tuplex.TableKeeper     owns the ETS tables so a Shard crash does not lose the space
+Tuplex                     public API, argument validation, delegation
+  Tuplex.Registry          tag -> {shard pid, table ref}   (unique keys)
+  Tuplex.ShardSupervisor   DynamicSupervisor, shards started on demand
+    └─ Tuplex.Shard        GenServer per tag — seq counter, and from step 3 waiters,
+       │                   leases, watches
+       └─ Tuplex.Store     pure functions over one ETS table — the ONLY module touching :ets
+  Tuplex.Template          pure — validation, key extraction, match-spec compilation
+  Tuplex.TableKeeper       holds tables as heir so a Shard crash does not lose the space
 ```
 
 Hard rule: **every `:ets` call lives inside `Tuplex.Store`.** `Shard` must never touch ETS
 directly. `Store` stays process-free and independently unit-testable, which is what makes
 the correctness-critical part of this system cheap to test.
+
+### The registry is the lookup path, not a feature
+
+`out` on an unseen tag has to resolve tag → pid before it can start a shard on demand, so
+the registry is load-bearing regardless. `Tuplex.tags/0` is then a by-product of the same
+table rather than something built for it.
+
+The registry value carries **the table reference alongside the pid**, and that settles a
+bigger question: whether reads go through the shard at all.
+
+```elixir
+Registry.register(Tuplex.Registry, tag, table_ref)
+```
+
+**They do not.** Serialising through a shard exists to stop two consumers taking the same
+tuple — a property of *destructive* operations only. `rdp` and `rd_all` mutate nothing and
+ETS reads are atomic per object, so a GenServer round-trip would buy no correctness while
+costing a message hop plus head-of-line blocking behind every `out` already queued.
+
+So: tables are **`:protected` with `read_concurrency: true`**, the shard is the sole
+writer, and **non-destructive reads execute in the calling process** after a registry
+lookup. The read path is one ETS lookup for the table reference plus one select, fully
+parallel across schedulers. `in` / `inp` always go through the shard.
+
+This matters more than it looks. The blackboard layer deferred out of v0.1 is `rd`-dominant
+by nature — many knowledge sources examining the same hypotheses — and reads that
+serialised on the tag's shard would bottleneck that layer on day one, on a decision made
+here.
+
+Two consequences, handled explicitly rather than papered over:
+
+- **Stale table references.** A shard that dies takes its table with it, and a caller may
+  hold the old reference. Reads rescue `ArgumentError`, re-resolve the tag **once**, and
+  retry; a second failure propagates. One retry, not a loop.
+
+  Re-resolving can return the *same* dead reference, because the registry's cleanup of a
+  dead shard is asynchronous. Liveness decides: a dead shard means the table went with it
+  and `:empty` is the honest answer; a live shard registered against a table it does not
+  have is a bug and is left to raise.
+
+- **Asymmetric semantics.** `rdp` is lock-free and returns a snapshot that may be stale on
+  return; `inp` is serialised and exact. The docs say so plainly — the same honesty already
+  applied to `inp`'s local exactness.
+
+### Shard lifecycle
+
+Shards are `:permanent` children of a `DynamicSupervisor` whose restart intensity is set
+well above the default 3-in-5s. Shards are independent, so pooling their failures into one
+tight budget means a few unrelated crashes take down the supervisor and every other tag's
+tuples with it. The blast radius of a crash should be one tag, not the space. The cap is
+raised rather than removed, so a shard that genuinely cannot start still gives up.
+
+`tags/0` lags in both directions, since registration and unregistration both happen around
+process lifecycle events. It is a snapshot, and documented as one.
+
+### The sequence counter
+
+Lives in the shard's **state**, not in ETS — it is serialised by construction, and
+`:ets.update_counter` would only add a write per `out` for no gain.
+
+It is initialised from the table, `:ets.last(tab) + 1`, not from zero. At v0.1 a crashed
+shard loses its table and zero would be correct, but once `TableKeeper` (step 4) hands a
+reclaimed table back, its rows are already numbered and a counter at zero would collide on
+the first insert and trip `Store.insert/3`'s raise — the right failure, but a needless one.
+Deriving from the table makes step 4 a no-op on this path. `:ets.last/1` returns
+`:"$end_of_table"` on an empty table.
+
+`Shard.out/1` returns `{:ok, seq}` even though `Tuplex.out/1` returns `:ok`: step 4's lease
+requeue has to identify a specific row, and threading the sequence through from the start
+is cheaper than retrofitting it.
 
 ### Storage form
 
@@ -266,7 +346,7 @@ this codebase to debug. **Property-tested**, not merely exampled.
 the project; there is no partial credit for a half-finished layer.
 
 1. `Tuplex.Template` + `Tuplex.Store`, with full unit tests — **done**
-2. `Tuplex.Shard` — `out`, `inp`, `rdp`
+2. `Tuplex.Shard` + `Tuplex.Registry` — `out`, `inp`, `rdp`, `tags` — **done**
 3. Blocking `in` / `rd` with the waiter index
 4. Leases + `Tuplex.TableKeeper`
 5. `watch`, `eval`, `rd_all`

@@ -55,10 +55,19 @@ defmodule Tuplex.Store do
 
   ## Concurrency
 
-  Tables are `:public` so that ownership can move to `Tuplex.TableKeeper` while shards
-  still write. `Store` assumes the shard owning a table is its only writer: `take/2` reads
-  a row and then deletes it in two steps, which is only atomic because the shard serialises
-  its own calls. Do not call `take/2` on one table from two processes.
+  Tables are `:protected` with `read_concurrency: true`: the owning shard is the only
+  writer, and any process may read.
+
+  That asymmetry is the point. Serialising through the shard exists to stop two consumers
+  taking the same tuple, which is a property of *destructive* operations only. `read/2` and
+  `read_all/2` mutate nothing and ETS reads are atomic per object, so routing them through
+  a GenServer would buy no correctness while costing a message round-trip and head-of-line
+  blocking behind every queued `out`. `Tuplex.Shard` therefore runs them in the calling
+  process; `take/2` and `insert/3` it keeps to itself.
+
+  `take/2` reads a row and then deletes it in two steps, which is atomic only because the
+  shard serialises its own calls. Never call `take/2` or `insert/3` on one table from two
+  processes.
   """
 
   alias Tuplex.Template
@@ -70,13 +79,40 @@ defmodule Tuplex.Store do
   @type seq :: integer()
 
   @doc """
-  Creates an empty table.
+  Creates an empty table owned by the calling process.
 
-  `:public` so that `Tuplex.TableKeeper` can hold it while shards write to it.
+  `:protected`, so only the owner writes and every process reads; `read_concurrency: true`
+  because the read path is the parallel one.
   """
   @spec new(atom()) :: tab()
   def new(name \\ :tuplex_store) when is_atom(name) do
-    :ets.new(name, [:ordered_set, :public])
+    :ets.new(name, [:ordered_set, :protected, read_concurrency: true])
+  end
+
+  @doc """
+  Returns the sequence number a shard should write next.
+
+  Derived from the table rather than started at zero. At v0.1 a crashed shard loses its
+  table and zero would do, but once `Tuplex.TableKeeper` hands a reclaimed table back the
+  rows in it are already numbered — a counter restarting at zero would collide on the first
+  insert and trip `insert/3`'s raise. That is the right failure, but a needless one, and
+  deriving the counter here makes the handover a no-op.
+
+  ## Examples
+
+      iex> tab = Tuplex.Store.new()
+      iex> Tuplex.Store.next_seq(tab)
+      1
+      iex> Tuplex.Store.insert(tab, 7, {:job, 1})
+      iex> Tuplex.Store.next_seq(tab)
+      8
+  """
+  @spec next_seq(tab()) :: seq()
+  def next_seq(tab) do
+    case :ets.last(tab) do
+      :"$end_of_table" -> 1
+      last -> last + 1
+    end
   end
 
   @doc """
