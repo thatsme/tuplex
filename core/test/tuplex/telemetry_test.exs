@@ -220,6 +220,8 @@ defmodule Tuplex.TelemetryTest do
       assert metadata.arity == 2
     end
 
+    # The eval task is meant to crash, so its report is expected output, not a signal.
+    @tag :capture_log
     test "a failure fires the exception event instead", %{tag: tag} do
       attach([[:tuplex, :eval], [:tuplex, :eval, :exception]], tag)
 

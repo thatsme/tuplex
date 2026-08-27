@@ -1,8 +1,6 @@
 defmodule Tuplex.EvalTest do
   use ExUnit.Case, async: true
 
-  alias Tuplex.Shard
-
   setup do
     {:ok, tag: unique_tag()}
   end
@@ -47,7 +45,10 @@ defmodule Tuplex.EvalTest do
 
   # eval has no failure channel on purpose: the arity of what it produces is whatever the
   # function returns, so an error result would have no shape a consumer could match.
+  # Every eval in this block is meant to crash; the task reports are expected output.
   describe "when the function fails" do
+    @describetag :capture_log
+
     setup do
       parent = self()
       handler = {__MODULE__, System.unique_integer([:positive])}
