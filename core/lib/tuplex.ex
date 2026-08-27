@@ -60,6 +60,30 @@ defmodule Tuplex do
   producers are behind. See `Tuplex.Telemetry`, and read its note on `tag` cardinality
   before mapping any of it onto metric labels.
 
+  ## Health and observability
+
+  `tags/0` reports a tag only once a shard exists for it, and a shard is started by the
+  first write or the first *blocking* read. A tag nothing has touched yet is therefore
+  absent, which is correct and is not what an operator reading a health endpoint expects:
+  "no shard" and "no traffic yet" are different answers to different questions.
+
+  To make a tag observable before any traffic, block on it briefly:
+
+      Tuplex.rd(template, timeout: 1)
+      #=> {:error, :timeout}, and the shard now exists
+
+  The wait path starts the shard before it registers a waiter, so the read creates the
+  shard and then times out having written nothing. A `watch/2` registered beforehand sees
+  no events, because there were none.
+
+  The `1` is deliberate and is not a typo for `0`. A `:timeout` of `0` is documented to
+  behave exactly like `rdp/1`, which takes the non-blocking path and does **not** start a
+  shard. One millisecond is the smallest value that reaches the code that does.
+
+  The obvious alternative — writing a probe tuple and immediately taking it back — works,
+  but produces an `:out` and an `:in` event under every tag it touches, so anything already
+  watching sees phantom traffic at startup.
+
   ## Calling `in/2`
 
   Call it qualified — `Tuplex.in(template)` — which is what the examples here do and what
